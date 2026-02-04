@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
 authors = [
-    { name = "Your Name", email = "you@example.com" },
+    { name = "Ryan C. Moon", email = "woodchipper@moonbase.io" },
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -38,8 +38,8 @@ dev = [
 woodchipper = "woodchipper.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/woodchipper"
-Repository = "https://github.com/yourusername/woodchipper"
+Homepage = "https://github.com/ryancmoon/woodchipper"
+Repository = "https://github.com/ryancmoon/woodchipper"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/woodchipper"]
