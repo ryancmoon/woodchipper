@@ -2,7 +2,7 @@
 
 All PDF files must be fed to the woodchipper.
 
-A Python library and CLI tool for analyzing PDF files. Extracts metadata, computes file hashes, and finds embedded URLs.
+A Python library and CLI tool for analyzing PDF files. Extracts metadata, computes file hashes, finds embedded URLs, detects forms, and identifies suspicious actions and anomalies. All URLs in output are automatically defanged for safe handling.
 
 ## Installation
 
@@ -28,20 +28,44 @@ pip install -e .
 woodchipper <path-to-pdf>
 ```
 
-Output is JSON:
+Output is JSON with defanged URLs:
 
-```bash
-$ woodchipper document.pdf
+```json
 {
-  "filename": "document.pdf",
+  "filename": "suspicious.pdf",
   "filesize": 142857,
   "md5": "d41d8cd98f00b204e9800998ecf8427e",
   "sha1": "da39a3ee5e6b4b0d3255bfef95601890afd80709",
   "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "urls": [
-    "https://example.com",
-    "https://test.org/page"
-  ]
+    "hXXps://example[.]com",
+    "hXXps://test[.]org/page"
+  ],
+  "metadata": {
+    "author": "John Doe",
+    "creator": "Microsoft Word",
+    "producer": "Microsoft: Print To PDF",
+    "subject": null,
+    "title": "Important Document",
+    "creation_date": "2024-01-15 12:00:00+00:00",
+    "modification_date": "2024-01-16 09:00:00+00:00",
+    "spoofing_indicators": []
+  },
+  "anomalies": {
+    "anomalies_present": true,
+    "anomalies": [
+      "PDF header not at byte 0 (found at byte 18)"
+    ],
+    "additional_actions_detected": [
+      "Document Open: JavaScript execution (code: app.alert('Hello');...)"
+    ]
+  },
+  "forms": {
+    "forms_present": true,
+    "form_submission_targets": [
+      "hXXps://collect[.]malicious[.]com/submit"
+    ]
+  }
 }
 ```
 
@@ -53,29 +77,23 @@ Exit codes:
 
 ### `process(file_path) -> PdfReport`
 
-Process a PDF file and return a full report.
+Process a PDF file and return a full report with all analysis.
 
 ```python
 from woodchipper import process
 
 report = process("document.pdf")
 print(report["sha256"])
-print(report["urls"])
+print(report["urls"])  # Defanged URLs
+print(report["metadata"]["spoofing_indicators"])
+print(report["anomalies"]["additional_actions_detected"])
 ```
 
-**Returns:** `PdfReport` dict with keys:
-- `filename` (str): Base filename
-- `filesize` (int): Size in bytes
-- `md5` (str): MD5 hash
-- `sha1` (str): SHA1 hash
-- `sha256` (str): SHA256 hash
-- `urls` (list[str]): URLs extracted from PDF link annotations
-
-**Raises:** `ValidationError` if file is invalid.
+**Note:** All URLs in the returned report are defanged for safe handling.
 
 ### `get_urls(file_path) -> list[str]`
 
-Extract URLs from a PDF file.
+Extract URLs from a PDF file (returns raw URLs, not defanged).
 
 ```python
 from woodchipper import get_urls
@@ -86,6 +104,89 @@ for url in urls:
 ```
 
 Extracts URLs from `/Link` annotations and `/A` (Action) dictionaries with `/URI` entries.
+
+### `get_pdf_metadata(file_path) -> PdfMetadata`
+
+Extract document metadata with spoofing detection.
+
+```python
+from woodchipper import get_pdf_metadata
+
+metadata = get_pdf_metadata("document.pdf")
+print(f"Author: {metadata['author']}")
+print(f"Creator: {metadata['creator']}")
+
+if metadata["spoofing_indicators"]:
+    print("Potential spoofing detected:")
+    for indicator in metadata["spoofing_indicators"]:
+        print(f"  - {indicator}")
+```
+
+**Spoofing detection includes:**
+- Creation date after modification date
+- Timestamps in the future
+- Creator/producer mismatches (e.g., claims Microsoft Word but produced by LibreOffice)
+- Creation date before PDF format existed (pre-1993)
+
+### `check_anomalies(file_path) -> PdfAnomalies`
+
+Check for PDF structural anomalies.
+
+```python
+from woodchipper import check_anomalies
+
+anomalies = check_anomalies("document.pdf")
+if anomalies["anomalies_present"]:
+    for anomaly in anomalies["anomalies"]:
+        print(f"Anomaly: {anomaly}")
+    for action in anomalies["additional_actions_detected"]:
+        print(f"Action: {action}")
+```
+
+**Detects:**
+- PDF header not at byte 0 (embedded content)
+- Invalid PDF version
+- Missing or malformed binary marker
+- Missing %%EOF marker
+- Data after %%EOF (appended content)
+- `/OpenAction` and `/AA` (Additional Actions) triggers
+
+### `detect_additionalactions(file_path) -> list[str]`
+
+Detect automatic actions triggered by PDF events.
+
+```python
+from woodchipper import detect_additionalactions
+
+actions = detect_additionalactions("document.pdf")
+for action in actions:
+    print(action)
+```
+
+**Detects actions triggered by:**
+- Document Open, Close, Save, Print
+- Page Open, Close
+
+**Action types identified:**
+- JavaScript execution
+- Launch external application
+- Open URL
+- Submit form data
+- And more
+
+### `extract_forms(file_path) -> PdfForms`
+
+Detect PDF forms and extract submission targets.
+
+```python
+from woodchipper import extract_forms
+
+forms = extract_forms("document.pdf")
+if forms["forms_present"]:
+    print("Form submission targets:")
+    for target in forms["form_submission_targets"]:
+        print(f"  {target}")
+```
 
 ### `validate_pdf(file_path) -> Path`
 
@@ -102,22 +203,11 @@ except ValidationError as e:
 
 ### `ValidationError`
 
-Exception raised when file validation fails. Possible reasons:
+Exception raised when file validation fails:
 - File not found
 - Path is not a file
 - File is not readable
 - File is not a PDF (based on magic bytes)
-
-### `PdfReport`
-
-TypedDict for type hints:
-
-```python
-from woodchipper import PdfReport
-
-def analyze(path: str) -> PdfReport:
-    return process(path)
-```
 
 ## Output Schema
 
@@ -134,9 +224,49 @@ def analyze(path: str) -> PdfReport:
     "urls": {
       "type": "array",
       "items": { "type": "string" }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "author": { "type": ["string", "null"] },
+        "creator": { "type": ["string", "null"] },
+        "producer": { "type": ["string", "null"] },
+        "subject": { "type": ["string", "null"] },
+        "title": { "type": ["string", "null"] },
+        "creation_date": { "type": ["string", "null"] },
+        "modification_date": { "type": ["string", "null"] },
+        "spoofing_indicators": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "anomalies": {
+      "type": "object",
+      "properties": {
+        "anomalies_present": { "type": "boolean" },
+        "anomalies": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "additional_actions_detected": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "forms": {
+      "type": "object",
+      "properties": {
+        "forms_present": { "type": "boolean" },
+        "form_submission_targets": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
     }
   },
-  "required": ["filename", "filesize", "md5", "sha1", "sha256", "urls"]
+  "required": ["filename", "filesize", "md5", "sha1", "sha256", "urls", "metadata", "anomalies", "forms"]
 }
 ```
 

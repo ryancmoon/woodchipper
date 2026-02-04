@@ -2,12 +2,43 @@
 
 import hashlib
 import os
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TypedDict
 
+import defang
 import magic
 from pypdf import PdfReader
 from pypdf.generic import ArrayObject, DictionaryObject
+
+
+class PdfMetadata(TypedDict):
+    """Metadata extracted from a PDF file."""
+
+    author: str | None
+    creator: str | None
+    producer: str | None
+    subject: str | None
+    title: str | None
+    creation_date: str | None
+    modification_date: str | None
+    spoofing_indicators: list[str]
+
+
+class PdfAnomalies(TypedDict):
+    """Anomaly detection results for a PDF file."""
+
+    anomalies_present: bool
+    anomalies: list[str]
+    additional_actions_detected: list[str]
+
+
+class PdfForms(TypedDict):
+    """Form detection results for a PDF file."""
+
+    forms_present: bool
+    form_submission_targets: list[str]
 
 
 class PdfReport(TypedDict):
@@ -19,6 +50,9 @@ class PdfReport(TypedDict):
     sha1: str
     sha256: str
     urls: list[str]
+    metadata: PdfMetadata
+    anomalies: PdfAnomalies
+    forms: PdfForms
 
 
 class ValidationError(Exception):
@@ -112,6 +146,597 @@ def get_urls(file_path: str | Path) -> list[str]:
     return sorted(urls)
 
 
+def _parse_pdf_date(date_str: str | None) -> datetime | None:
+    """Parse a PDF date string to datetime.
+
+    PDF dates are in format: D:YYYYMMDDHHmmSSOHH'mm'
+    where O is the timezone offset direction (+/-/Z).
+    """
+    if not date_str:
+        return None
+
+    # Remove the D: prefix if present
+    if date_str.startswith("D:"):
+        date_str = date_str[2:]
+
+    # Try to parse various PDF date formats
+    patterns = [
+        (r"^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})([+-])(\d{2})'(\d{2})'?$", True),
+        (r"^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})Z", False),
+        (r"^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})$", False),
+        (r"^(\d{4})(\d{2})(\d{2})$", False),
+    ]
+
+    for pattern, has_tz in patterns:
+        match = re.match(pattern, date_str)
+        if match:
+            groups = match.groups()
+            try:
+                year = int(groups[0])
+                month = int(groups[1])
+                day = int(groups[2])
+                hour = int(groups[3]) if len(groups) > 3 else 0
+                minute = int(groups[4]) if len(groups) > 4 else 0
+                second = int(groups[5]) if len(groups) > 5 else 0
+
+                return datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+            except (ValueError, IndexError):
+                continue
+
+    return None
+
+
+def get_pdf_metadata(file_path: str | Path) -> PdfMetadata:
+    """Extract metadata from a PDF file with spoofing indicators.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        PdfMetadata containing author, creator, producer, timestamps,
+        and a list of potential spoofing indicators.
+
+    Raises:
+        ValidationError: If the file isn't a valid, readable PDF.
+    """
+    path = validate_pdf(file_path)
+    reader = PdfReader(str(path))
+    meta = reader.metadata
+
+    spoofing_indicators: list[str] = []
+
+    # Extract metadata fields
+    author = str(meta.author) if meta and meta.author else None
+    creator = str(meta.creator) if meta and meta.creator else None
+    producer = str(meta.producer) if meta and meta.producer else None
+    subject = str(meta.subject) if meta and meta.subject else None
+    title = str(meta.title) if meta and meta.title else None
+
+    # Extract dates - pypdf returns datetime objects directly
+    creation_dt: datetime | None = None
+    modification_dt: datetime | None = None
+
+    if meta:
+        if meta.creation_date:
+            if isinstance(meta.creation_date, datetime):
+                creation_dt = meta.creation_date
+                # Ensure timezone-aware for comparison
+                if creation_dt.tzinfo is None:
+                    creation_dt = creation_dt.replace(tzinfo=timezone.utc)
+            else:
+                creation_dt = _parse_pdf_date(str(meta.creation_date))
+        elif hasattr(meta, "get") and meta.get("/CreationDate"):
+            creation_dt = _parse_pdf_date(str(meta.get("/CreationDate")))
+
+        if meta.modification_date:
+            if isinstance(meta.modification_date, datetime):
+                modification_dt = meta.modification_date
+                # Ensure timezone-aware for comparison
+                if modification_dt.tzinfo is None:
+                    modification_dt = modification_dt.replace(tzinfo=timezone.utc)
+            else:
+                modification_dt = _parse_pdf_date(str(meta.modification_date))
+        elif hasattr(meta, "get") and meta.get("/ModDate"):
+            modification_dt = _parse_pdf_date(str(meta.get("/ModDate")))
+
+    # Format dates as strings for output
+    creation_date = str(creation_dt) if creation_dt else None
+    modification_date = str(modification_dt) if modification_dt else None
+
+    now = datetime.now(timezone.utc)
+
+    # Spoofing detection checks
+
+    # Check for creation date after modification date
+    if creation_dt and modification_dt and creation_dt > modification_dt:
+        spoofing_indicators.append(
+            "Creation date is after modification date"
+        )
+
+    # Check for future timestamps
+    if creation_dt and creation_dt > now:
+        spoofing_indicators.append(
+            f"Creation date is in the future: {creation_date}"
+        )
+
+    if modification_dt and modification_dt > now:
+        spoofing_indicators.append(
+            f"Modification date is in the future: {modification_date}"
+        )
+
+    # Check for creator/producer mismatches that suggest spoofing
+    if creator and producer:
+        creator_lower = creator.lower()
+        producer_lower = producer.lower()
+
+        # Microsoft Office should produce with Microsoft
+        if "microsoft" in creator_lower and "microsoft" not in producer_lower:
+            if "libreoffice" in producer_lower or "openoffice" in producer_lower:
+                spoofing_indicators.append(
+                    f"Creator claims Microsoft but producer is {producer}"
+                )
+
+        # Adobe products should generally match
+        if "adobe" in creator_lower and "adobe" not in producer_lower:
+            if "libreoffice" in producer_lower or "openoffice" in producer_lower:
+                spoofing_indicators.append(
+                    f"Creator claims Adobe but producer is {producer}"
+                )
+
+        # Check for known PDF generator mismatches
+        if "word" in creator_lower and "writer" in producer_lower:
+            spoofing_indicators.append(
+                f"Creator claims Word but producer suggests LibreOffice Writer"
+            )
+
+    # Check for suspiciously empty metadata when producer exists
+    if producer and not author and not creator and not title:
+        spoofing_indicators.append(
+            "Producer set but author, creator, and title are all empty"
+        )
+
+    # Check for very old creation dates (before PDF existed - 1993)
+    if creation_dt and creation_dt.year < 1993:
+        spoofing_indicators.append(
+            f"Creation date predates PDF format: {creation_date}"
+        )
+
+    return PdfMetadata(
+        author=author,
+        creator=creator,
+        producer=producer,
+        subject=subject,
+        title=title,
+        creation_date=creation_date,
+        modification_date=modification_date,
+        spoofing_indicators=spoofing_indicators,
+    )
+
+
+# Valid PDF versions per ISO 32000
+_VALID_PDF_VERSIONS = {"1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6", "1.7", "2.0"}
+
+
+def check_anomalies(file_path: str | Path) -> PdfAnomalies:
+    """Check for malformed PDF headers and version anomalies.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        PdfAnomalies with anomalies_present flag and description of issues found.
+
+    Raises:
+        ValidationError: If the file isn't a valid, readable PDF.
+    """
+    path = validate_pdf(file_path)
+    anomalies: list[str] = []
+
+    with open(path, "rb") as f:
+        # Read first 1024 bytes for header analysis
+        header_bytes = f.read(1024)
+
+        # Check if PDF header starts at byte 0
+        if not header_bytes.startswith(b"%PDF-"):
+            # Search for header within first 1024 bytes
+            header_pos = header_bytes.find(b"%PDF-")
+            if header_pos == -1:
+                anomalies.append("PDF header not found in first 1024 bytes")
+            elif header_pos > 0:
+                anomalies.append(
+                    f"PDF header not at byte 0 (found at byte {header_pos}); "
+                    "data before header may indicate embedded content or manipulation"
+                )
+
+        # Extract and validate version
+        header_match = re.search(rb"%PDF-(\d+\.\d+)", header_bytes)
+        if header_match:
+            version = header_match.group(1).decode("ascii")
+            if version not in _VALID_PDF_VERSIONS:
+                anomalies.append(
+                    f"Invalid PDF version '{version}'; "
+                    f"valid versions are: {', '.join(sorted(_VALID_PDF_VERSIONS))}"
+                )
+        else:
+            anomalies.append("Could not parse PDF version from header")
+
+        # Check for binary marker (second line should have high-byte chars)
+        # Per PDF spec, line after header should contain at least 4 chars > 127
+        lines = header_bytes.split(b"\n", 2)
+        if len(lines) >= 2:
+            second_line = lines[1]
+            # Check if it's a comment with binary characters
+            if second_line.startswith(b"%"):
+                high_bytes = sum(1 for b in second_line if b > 127)
+                if high_bytes < 4:
+                    anomalies.append(
+                        "Binary marker line missing or malformed; "
+                        "PDF may not be recognized as binary by some tools"
+                    )
+
+        # Check for %%EOF marker
+        f.seek(0, 2)  # Seek to end
+        file_size = f.tell()
+        # Read last 1024 bytes to find EOF
+        read_size = min(1024, file_size)
+        f.seek(-read_size, 2)
+        tail_bytes = f.read(read_size)
+
+        if b"%%EOF" not in tail_bytes:
+            anomalies.append("%%EOF marker not found at end of file")
+        else:
+            # Check if there's significant data after %%EOF
+            eof_pos = tail_bytes.rfind(b"%%EOF")
+            after_eof = tail_bytes[eof_pos + 5:].strip()
+            if len(after_eof) > 10:
+                anomalies.append(
+                    f"Data found after %%EOF marker ({len(after_eof)} bytes); "
+                    "may indicate appended content"
+                )
+
+    # Detect additional actions
+    additional_actions = detect_additionalactions(path)
+
+    has_anomalies = bool(anomalies) or bool(additional_actions)
+
+    return PdfAnomalies(
+        anomalies_present=has_anomalies,
+        anomalies=anomalies,
+        additional_actions_detected=additional_actions,
+    )
+
+
+def detect_additionalactions(file_path: str | Path) -> list[str]:
+    """Detect /AA (Additional Actions) and /OpenAction tags in a PDF.
+
+    Identifies automatic actions triggered on document open, close, or page view.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        List of detected actions and their triggers.
+
+    Raises:
+        ValidationError: If the file isn't a valid, readable PDF.
+    """
+    path = validate_pdf(file_path)
+    actions_found: list[str] = []
+
+    try:
+        reader = PdfReader(str(path))
+    except Exception:
+        # PDF is too malformed to parse for actions
+        return []
+
+    # Check document catalog for /OpenAction
+    if reader.trailer and "/Root" in reader.trailer:
+        root = reader.trailer["/Root"]
+        if hasattr(root, "get_object"):
+            root = root.get_object()
+
+        if isinstance(root, DictionaryObject):
+            # Check /OpenAction (action on document open)
+            if "/OpenAction" in root:
+                open_action = root["/OpenAction"]
+                if hasattr(open_action, "get_object"):
+                    open_action = open_action.get_object()
+                action_desc = _describe_action(open_action, "Document Open")
+                if action_desc:
+                    actions_found.append(action_desc)
+
+            # Check /AA (Additional Actions) at document level
+            if "/AA" in root:
+                aa = root["/AA"]
+                if hasattr(aa, "get_object"):
+                    aa = aa.get_object()
+                if isinstance(aa, DictionaryObject):
+                    _extract_additional_actions(aa, "Document", actions_found)
+
+    # Check each page for /AA (Additional Actions)
+    for i, page in enumerate(reader.pages, start=1):
+        page_dict = page.get_object() if hasattr(page, "get_object") else page
+        if isinstance(page_dict, DictionaryObject) and "/AA" in page_dict:
+            aa = page_dict["/AA"]
+            if hasattr(aa, "get_object"):
+                aa = aa.get_object()
+            if isinstance(aa, DictionaryObject):
+                _extract_additional_actions(aa, f"Page {i}", actions_found)
+
+    return actions_found
+
+
+def _extract_additional_actions(
+    aa: DictionaryObject, context: str, actions_found: list[str]
+) -> None:
+    """Extract actions from an Additional Actions (/AA) dictionary.
+
+    Args:
+        aa: The /AA dictionary object.
+        context: Description of where the /AA was found (e.g., "Document", "Page 1").
+        actions_found: List to append action descriptions to.
+    """
+    # Document-level triggers
+    trigger_map = {
+        "/WC": "Document Will Close",
+        "/WS": "Document Will Save",
+        "/DS": "Document Did Save",
+        "/WP": "Document Will Print",
+        "/DP": "Document Did Print",
+        # Page-level triggers
+        "/O": "Page Open",
+        "/C": "Page Close",
+    }
+
+    for key, trigger_name in trigger_map.items():
+        if key in aa:
+            action = aa[key]
+            if hasattr(action, "get_object"):
+                action = action.get_object()
+            action_desc = _describe_action(action, f"{context} - {trigger_name}")
+            if action_desc:
+                actions_found.append(action_desc)
+
+
+def _describe_action(action: DictionaryObject | ArrayObject, trigger: str) -> str | None:
+    """Describe a PDF action for reporting.
+
+    Args:
+        action: The action object (dictionary or array).
+        trigger: Description of what triggers this action.
+
+    Returns:
+        Human-readable description of the action, or None if not an action.
+    """
+    # Handle array (could be a destination array)
+    if isinstance(action, ArrayObject):
+        return f"{trigger}: GoTo destination"
+
+    if not isinstance(action, DictionaryObject):
+        return None
+
+    action_type = action.get("/S")
+    if not action_type:
+        # Might be a destination dictionary
+        if "/D" in action:
+            return f"{trigger}: GoTo destination"
+        return None
+
+    action_type_str = str(action_type)
+
+    # Map action types to descriptions
+    action_descriptions = {
+        "/JavaScript": "JavaScript execution",
+        "/JS": "JavaScript execution",
+        "/Launch": "Launch external application",
+        "/URI": "Open URL",
+        "/GoTo": "GoTo destination",
+        "/GoToR": "GoTo remote document",
+        "/GoToE": "GoTo embedded document",
+        "/SubmitForm": "Submit form data",
+        "/ImportData": "Import data",
+        "/Rendition": "Play multimedia",
+        "/Sound": "Play sound",
+        "/Movie": "Play movie",
+        "/Hide": "Hide/show annotation",
+        "/Named": "Execute named action",
+        "/SetOCGState": "Change layer visibility",
+    }
+
+    action_name = action_descriptions.get(action_type_str, f"Unknown action ({action_type_str})")
+
+    # Add extra detail for certain action types
+    details = []
+
+    if action_type_str in ("/JavaScript", "/JS"):
+        js = action.get("/JS")
+        if js:
+            js_str = str(js)[:100]  # Truncate long JS
+            if len(str(js)) > 100:
+                js_str += "..."
+            details.append(f"code: {js_str}")
+
+    elif action_type_str == "/URI":
+        uri = action.get("/URI")
+        if uri:
+            details.append(f"target: {uri}")
+
+    elif action_type_str == "/Launch":
+        if "/F" in action:
+            details.append(f"file: {action['/F']}")
+        if "/Win" in action:
+            win = action["/Win"]
+            if hasattr(win, "get_object"):
+                win = win.get_object()
+            if isinstance(win, DictionaryObject):
+                if "/F" in win:
+                    details.append(f"file: {win['/F']}")
+                if "/P" in win:
+                    details.append(f"params: {win['/P']}")
+
+    elif action_type_str == "/Named":
+        name = action.get("/N")
+        if name:
+            details.append(f"name: {name}")
+
+    detail_str = f" ({', '.join(details)})" if details else ""
+    return f"{trigger}: {action_name}{detail_str}"
+
+
+def extract_forms(file_path: str | Path) -> PdfForms:
+    """Extract form information from a PDF file.
+
+    Detects AcroForms and extracts form submission target URLs.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        PdfForms with forms_present flag and list of submission target URLs.
+
+    Raises:
+        ValidationError: If the file isn't a valid, readable PDF.
+    """
+    path = validate_pdf(file_path)
+    submission_targets: set[str] = set()
+
+    reader = PdfReader(str(path))
+
+    # Check for AcroForm in the document catalog
+    has_acroform = False
+    if reader.trailer and "/Root" in reader.trailer:
+        root = reader.trailer["/Root"]
+        if hasattr(root, "get_object"):
+            root = root.get_object()
+        if isinstance(root, DictionaryObject) and "/AcroForm" in root:
+            has_acroform = True
+            acro_form = root["/AcroForm"]
+            if hasattr(acro_form, "get_object"):
+                acro_form = acro_form.get_object()
+
+            # Extract form fields
+            if isinstance(acro_form, DictionaryObject):
+                _extract_form_actions(acro_form, submission_targets)
+
+                # Check /Fields array for form fields
+                if "/Fields" in acro_form:
+                    fields = acro_form["/Fields"]
+                    if hasattr(fields, "get_object"):
+                        fields = fields.get_object()
+                    if isinstance(fields, ArrayObject):
+                        for field_ref in fields:
+                            field = field_ref.get_object() if hasattr(field_ref, "get_object") else field_ref
+                            if isinstance(field, DictionaryObject):
+                                _extract_form_actions(field, submission_targets)
+
+    # Also check page annotations for widget annotations with actions
+    for page in reader.pages:
+        annotations = page.get("/Annots")
+        if annotations is None:
+            continue
+
+        if hasattr(annotations, "get_object"):
+            annotations = annotations.get_object()
+
+        if isinstance(annotations, ArrayObject):
+            annot_list = annotations
+        else:
+            annot_list = [annotations]
+
+        for annot_ref in annot_list:
+            annot = annot_ref.get_object() if hasattr(annot_ref, "get_object") else annot_ref
+
+            if not isinstance(annot, DictionaryObject):
+                continue
+
+            # Check if this is a Widget annotation (form field)
+            subtype = annot.get("/Subtype")
+            if subtype == "/Widget":
+                has_acroform = True
+                _extract_form_actions(annot, submission_targets)
+
+    return PdfForms(
+        forms_present=has_acroform,
+        form_submission_targets=sorted(submission_targets),
+    )
+
+
+def _extract_form_actions(obj: DictionaryObject, targets: set[str]) -> None:
+    """Extract submission URLs from form field actions.
+
+    Args:
+        obj: Dictionary object that may contain form actions.
+        targets: Set to add discovered submission URLs to.
+    """
+    # Check /A (action) dictionary
+    if "/A" in obj:
+        action = obj["/A"]
+        if hasattr(action, "get_object"):
+            action = action.get_object()
+        if isinstance(action, DictionaryObject):
+            _process_action(action, targets)
+
+    # Check /AA (additional actions) dictionary
+    if "/AA" in obj:
+        aa = obj["/AA"]
+        if hasattr(aa, "get_object"):
+            aa = aa.get_object()
+        if isinstance(aa, DictionaryObject):
+            # Check various trigger actions
+            for key in ["/F", "/K", "/V", "/C"]:  # Format, Keystroke, Validate, Calculate
+                if key in aa:
+                    action = aa[key]
+                    if hasattr(action, "get_object"):
+                        action = action.get_object()
+                    if isinstance(action, DictionaryObject):
+                        _process_action(action, targets)
+
+
+def _process_action(action: DictionaryObject, targets: set[str]) -> None:
+    """Process an action dictionary to extract submission URLs.
+
+    Args:
+        action: Action dictionary object.
+        targets: Set to add discovered submission URLs to.
+    """
+    action_type = action.get("/S")
+
+    # SubmitForm action
+    if action_type == "/SubmitForm":
+        # /F contains the URL or file specification
+        if "/F" in action:
+            f_value = action["/F"]
+            if hasattr(f_value, "get_object"):
+                f_value = f_value.get_object()
+
+            if isinstance(f_value, str):
+                targets.add(f_value)
+            elif isinstance(f_value, DictionaryObject):
+                # File specification dictionary
+                if "/F" in f_value:
+                    targets.add(str(f_value["/F"]))
+                elif "/UF" in f_value:
+                    targets.add(str(f_value["/UF"]))
+
+    # URI action (can also be used for form submission)
+    elif action_type == "/URI":
+        if "/URI" in action:
+            targets.add(str(action["/URI"]))
+
+    # Check for chained /Next actions
+    if "/Next" in action:
+        next_action = action["/Next"]
+        if hasattr(next_action, "get_object"):
+            next_action = next_action.get_object()
+        if isinstance(next_action, DictionaryObject):
+            _process_action(next_action, targets)
+        elif isinstance(next_action, ArrayObject):
+            for item in next_action:
+                item_obj = item.get_object() if hasattr(item, "get_object") else item
+                if isinstance(item_obj, DictionaryObject):
+                    _process_action(item_obj, targets)
+
+
 def compute_hashes(file_path: Path) -> tuple[str, str, str]:
     """Compute MD5, SHA1, and SHA256 hashes of a file.
 
@@ -137,11 +762,14 @@ def compute_hashes(file_path: Path) -> tuple[str, str, str]:
 def process(file_path: str | Path) -> PdfReport:
     """Process a PDF file and generate a report.
 
+    All URLs in the output are defanged for safe handling.
+
     Args:
         file_path: Path to the PDF file to process.
 
     Returns:
-        PdfReport containing file metadata, hashes, and extracted URLs.
+        PdfReport containing file metadata, hashes, extracted URLs,
+        document metadata, anomaly detection results, and form information.
 
     Raises:
         ValidationError: If the file isn't a valid, readable PDF.
@@ -150,6 +778,15 @@ def process(file_path: str | Path) -> PdfReport:
 
     md5, sha1, sha256 = compute_hashes(path)
     urls = get_urls(path)
+    metadata = get_pdf_metadata(path)
+    anomalies = check_anomalies(path)
+    forms = extract_forms(path)
+
+    # Defang all URLs for safe handling
+    defanged_urls = [defang.defang(url) for url in urls]
+    defanged_form_targets = [
+        defang.defang(url) for url in forms["form_submission_targets"]
+    ]
 
     return PdfReport(
         filename=path.name,
@@ -157,5 +794,11 @@ def process(file_path: str | Path) -> PdfReport:
         md5=md5,
         sha1=sha1,
         sha256=sha256,
-        urls=urls,
+        urls=defanged_urls,
+        metadata=metadata,
+        anomalies=anomalies,
+        forms=PdfForms(
+            forms_present=forms["forms_present"],
+            form_submission_targets=defanged_form_targets,
+        ),
     )

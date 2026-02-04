@@ -81,3 +81,17 @@ startxref
         assert "sha1" in report
         assert "sha256" in report
         assert "urls" in report
+        assert "metadata" in report
+        assert isinstance(report["metadata"], dict)
+        assert "spoofing_indicators" in report["metadata"]
+        assert "anomalies" in report
+        assert isinstance(report["anomalies"], dict)
+        assert "anomalies_present" in report["anomalies"]
+        assert "anomalies" in report["anomalies"]
+        assert isinstance(report["anomalies"]["anomalies"], list)
+        assert "additional_actions_detected" in report["anomalies"]
+        assert isinstance(report["anomalies"]["additional_actions_detected"], list)
+        assert "forms" in report
+        assert isinstance(report["forms"], dict)
+        assert "forms_present" in report["forms"]
+        assert "form_submission_targets" in report["forms"]

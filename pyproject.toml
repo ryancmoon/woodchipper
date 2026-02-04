@@ -25,6 +25,7 @@ classifiers = [
 dependencies = [
     "python-magic>=0.4.27",
     "pypdf>=4.0.0",
+    "defang>=0.5.3",
 ]
 
 [project.optional-dependencies]
