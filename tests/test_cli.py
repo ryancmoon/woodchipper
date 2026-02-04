@@ -93,6 +93,8 @@ startxref
         assert isinstance(report["anomalies"]["additional_actions_detected"], list)
         assert "external_actions" in report["anomalies"]
         assert isinstance(report["anomalies"]["external_actions"], list)
+        assert "javascript_detected" in report["anomalies"]
+        assert isinstance(report["anomalies"]["javascript_detected"], list)
         assert "forms" in report
         assert isinstance(report["forms"], dict)
         assert "forms_present" in report["forms"]

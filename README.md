@@ -62,6 +62,9 @@ Output is JSON with all string fields defanged:
     "external_actions": [
       "/Launch at Document OpenAction: Launches external application (file: cmd.exe)",
       "/URI at Page 1 Annotation 1: Opens URL (hXXps://malicious[.]com)"
+    ],
+    "javascript_detected": [
+      "Document OpenAction: displays alert (code: app.alert('Hello');)"
     ]
   },
   "forms": {
@@ -92,6 +95,7 @@ print(report["urls"])  # Defanged URLs
 print(report["metadata"]["spoofing_indicators"])
 print(report["anomalies"]["additional_actions_detected"])
 print(report["anomalies"]["external_actions"])
+print(report["anomalies"]["javascript_detected"])
 ```
 
 **Note:** All string fields in the returned report are defanged for safe handling.
@@ -148,6 +152,8 @@ if anomalies["anomalies_present"]:
         print(f"Action: {action}")
     for external in anomalies["external_actions"]:
         print(f"External: {external}")
+    for js in anomalies["javascript_detected"]:
+        print(f"JavaScript: {js}")
 ```
 
 **Detects:**
@@ -158,6 +164,7 @@ if anomalies["anomalies_present"]:
 - Data after %%EOF (appended content)
 - `/OpenAction` and `/AA` (Additional Actions) triggers
 - External actions (`/Launch`, `/URI`, `/GoToR`, `/GoToE`)
+- Embedded JavaScript with behavior analysis
 
 ### `detect_additionalactions(file_path) -> list[str]`
 
@@ -206,6 +213,43 @@ for action in actions:
 /URI at Page 1 Annotation 1: Opens URL (https://example.com)
 /GoToR at Page 2 Annotation 3: Opens remote PDF document (file: remote.pdf)
 /GoToE at Document OpenAction: Opens embedded document (file: embedded.pdf)
+```
+
+### `detect_javascript(file_path) -> list[str]`
+
+Detect JavaScript code embedded in a PDF with behavior analysis.
+
+```python
+from woodchipper import detect_javascript
+
+scripts = detect_javascript("document.pdf")
+for script in scripts:
+    print(script)
+```
+
+**Detects `/JavaScript` and `/JS` tags in:**
+- Document OpenAction
+- Document and page Additional Actions (/AA)
+- Named JavaScript in the Names tree
+- Annotation actions
+
+**Behavior analysis identifies:**
+- `displays alert` - app.alert() calls
+- `launches URL` - app.launchURL() calls
+- `submits form data` - this.submitForm() calls
+- `exports data` - exportDataAsObject() calls
+- `evaluates dynamic code` - eval() usage
+- `decodes obfuscated content` - unescape(), fromCharCode()
+- `makes network request` - XMLHttp, SOAP calls
+- `accesses form fields` - this.getField() calls
+- `sets timer/delayed execution` - setInterval/setTimeout
+- `potential heap spray` - Collab.getIcon exploit pattern
+
+**Output format:**
+```
+Document OpenAction: displays alert (code: app.alert('Hello World');)
+Page 1 Annotation 1 Mouse Down: launches URL; evaluates dynamic code (code: var url = eval(x); app.launchURL(url);...)
+Named JavaScript 'init': defines function; contains URL reference (code: function init() { ... }...)
 ```
 
 ### `extract_forms(file_path) -> PdfForms`
@@ -288,6 +332,10 @@ Exception raised when file validation fails:
           "items": { "type": "string" }
         },
         "external_actions": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "javascript_detected": {
           "type": "array",
           "items": { "type": "string" }
         }

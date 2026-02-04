@@ -33,6 +33,7 @@ class PdfAnomalies(TypedDict):
     anomalies: list[str]
     additional_actions_detected: list[str]
     external_actions: list[str]
+    javascript_detected: list[str]
 
 
 class PdfForms(TypedDict):
@@ -401,13 +402,22 @@ def check_anomalies(file_path: str | Path) -> PdfAnomalies:
     # Detect external actions
     external_actions = detect_external_actions(path)
 
-    has_anomalies = bool(anomalies) or bool(additional_actions) or bool(external_actions)
+    # Detect JavaScript
+    javascript = detect_javascript(path)
+
+    has_anomalies = (
+        bool(anomalies)
+        or bool(additional_actions)
+        or bool(external_actions)
+        or bool(javascript)
+    )
 
     return PdfAnomalies(
         anomalies_present=has_anomalies,
         anomalies=anomalies,
         additional_actions_detected=additional_actions,
         external_actions=external_actions,
+        javascript_detected=javascript,
     )
 
 
@@ -667,6 +677,251 @@ def detect_external_actions(file_path: str | Path) -> list[str]:
                             _check_action_dict(aa[key], f"{location} AA {trigger}")
 
     return external_actions
+
+
+def detect_javascript(file_path: str | Path) -> list[str]:
+    """Detect JavaScript code embedded in a PDF.
+
+    Scans for /JavaScript and /JS tags and extracts information about
+    the scripts found, including a summary of what they do.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        List of detected JavaScript with descriptions of what they do.
+
+    Raises:
+        ValidationError: If the file isn't a valid, readable PDF.
+    """
+    path = validate_pdf(file_path)
+    javascript_found: list[str] = []
+
+    try:
+        reader = PdfReader(str(path))
+    except Exception:
+        # PDF is too malformed to parse
+        return []
+
+    def _summarize_js(js_code: str) -> str:
+        """Generate a brief summary of what the JavaScript does."""
+        js_lower = js_code.lower()
+        behaviors = []
+
+        # Detect common malicious/suspicious patterns
+        if "app.launchurl" in js_lower or "launchurl" in js_lower:
+            behaviors.append("launches URL")
+        if "app.alert" in js_lower or "alert(" in js_lower:
+            behaviors.append("displays alert")
+        if "this.submitform" in js_lower or "submitform" in js_lower:
+            behaviors.append("submits form data")
+        if "exportdataasobject" in js_lower or "exportdata" in js_lower:
+            behaviors.append("exports data")
+        if "app.openfile" in js_lower or "openfile" in js_lower:
+            behaviors.append("opens file")
+        if "util.printf" in js_lower and ("%" in js_code):
+            behaviors.append("format string operation")
+        if "eval(" in js_lower:
+            behaviors.append("evaluates dynamic code")
+        if "unescape(" in js_lower or "fromcharcode" in js_lower:
+            behaviors.append("decodes obfuscated content")
+        if "xmlhttp" in js_lower or "soap" in js_lower:
+            behaviors.append("makes network request")
+        if "this.getfield" in js_lower or "getfield" in js_lower:
+            behaviors.append("accesses form fields")
+        if "spell.customdictionaryopen" in js_lower:
+            behaviors.append("accesses spell check dictionary")
+        if "app.setinterval" in js_lower or "settimeout" in js_lower:
+            behaviors.append("sets timer/delayed execution")
+        if "collab.geticon" in js_lower:
+            behaviors.append("potential heap spray (Collab.getIcon)")
+        if "util.printd" in js_lower:
+            behaviors.append("date formatting")
+        if "media.newplayer" in js_lower:
+            behaviors.append("creates media player")
+        if "annot" in js_lower and ("destroy" in js_lower or "hidden" in js_lower):
+            behaviors.append("manipulates annotations")
+
+        if not behaviors:
+            # Check for general patterns if no specific ones found
+            if "http" in js_lower or "https" in js_lower:
+                behaviors.append("contains URL reference")
+            if "function" in js_lower:
+                behaviors.append("defines function")
+            if len(js_code) > 500:
+                behaviors.append("large script block")
+
+        if behaviors:
+            return "; ".join(behaviors)
+        return "unknown behavior"
+
+    def _extract_js_code(action: DictionaryObject) -> str | None:
+        """Extract JavaScript code from an action dictionary."""
+        js = action.get("/JS")
+        if js is None:
+            return None
+
+        if hasattr(js, "get_object"):
+            js = js.get_object()
+
+        # Handle stream objects
+        if hasattr(js, "get_data"):
+            try:
+                return js.get_data().decode("utf-8", errors="replace")
+            except Exception:
+                return str(js)
+
+        return str(js)
+
+    def _process_js_action(action: DictionaryObject, location: str) -> None:
+        """Process an action that may contain JavaScript."""
+        action_type = action.get("/S")
+        if action_type and str(action_type) in ("/JavaScript", "/JS"):
+            js_code = _extract_js_code(action)
+            if js_code:
+                # Truncate for display
+                code_preview = js_code[:150].replace("\n", " ").replace("\r", " ")
+                if len(js_code) > 150:
+                    code_preview += "..."
+
+                summary = _summarize_js(js_code)
+                javascript_found.append(
+                    f"{location}: {summary} (code: {code_preview})"
+                )
+
+        # Check for chained /Next actions
+        if "/Next" in action:
+            next_action = action["/Next"]
+            if hasattr(next_action, "get_object"):
+                next_action = next_action.get_object()
+            if isinstance(next_action, DictionaryObject):
+                _process_js_action(next_action, f"{location} (chained)")
+            elif isinstance(next_action, ArrayObject):
+                for i, item in enumerate(next_action):
+                    item_obj = item.get_object() if hasattr(item, "get_object") else item
+                    if isinstance(item_obj, DictionaryObject):
+                        _process_js_action(item_obj, f"{location} (chained {i+1})")
+
+    def _check_action(action, location: str) -> None:
+        """Check an action object for JavaScript."""
+        if hasattr(action, "get_object"):
+            action = action.get_object()
+        if isinstance(action, DictionaryObject):
+            _process_js_action(action, location)
+
+    # Check for document-level JavaScript in Names tree
+    if reader.trailer and "/Root" in reader.trailer:
+        root = reader.trailer["/Root"]
+        if hasattr(root, "get_object"):
+            root = root.get_object()
+
+        if isinstance(root, DictionaryObject):
+            # Check /OpenAction
+            if "/OpenAction" in root:
+                _check_action(root["/OpenAction"], "Document OpenAction")
+
+            # Check document-level /AA
+            if "/AA" in root:
+                aa = root["/AA"]
+                if hasattr(aa, "get_object"):
+                    aa = aa.get_object()
+                if isinstance(aa, DictionaryObject):
+                    for key, trigger in [
+                        ("/WC", "Document Will Close"),
+                        ("/WS", "Document Will Save"),
+                        ("/DS", "Document Did Save"),
+                        ("/WP", "Document Will Print"),
+                        ("/DP", "Document Did Print"),
+                    ]:
+                        if key in aa:
+                            _check_action(aa[key], trigger)
+
+            # Check /Names dictionary for JavaScript
+            if "/Names" in root:
+                names = root["/Names"]
+                if hasattr(names, "get_object"):
+                    names = names.get_object()
+                if isinstance(names, DictionaryObject) and "/JavaScript" in names:
+                    js_names = names["/JavaScript"]
+                    if hasattr(js_names, "get_object"):
+                        js_names = js_names.get_object()
+                    if isinstance(js_names, DictionaryObject) and "/Names" in js_names:
+                        js_array = js_names["/Names"]
+                        if hasattr(js_array, "get_object"):
+                            js_array = js_array.get_object()
+                        if isinstance(js_array, ArrayObject):
+                            # Names array is [name1, obj1, name2, obj2, ...]
+                            for i in range(0, len(js_array), 2):
+                                if i + 1 < len(js_array):
+                                    name = str(js_array[i])
+                                    action = js_array[i + 1]
+                                    if hasattr(action, "get_object"):
+                                        action = action.get_object()
+                                    if isinstance(action, DictionaryObject):
+                                        _process_js_action(action, f"Named JavaScript '{name}'")
+
+    # Check each page
+    for page_num, page in enumerate(reader.pages, start=1):
+        page_dict = page.get_object() if hasattr(page, "get_object") else page
+        if not isinstance(page_dict, DictionaryObject):
+            continue
+
+        # Check page-level /AA
+        if "/AA" in page_dict:
+            aa = page_dict["/AA"]
+            if hasattr(aa, "get_object"):
+                aa = aa.get_object()
+            if isinstance(aa, DictionaryObject):
+                for key, trigger in [("/O", "Page Open"), ("/C", "Page Close")]:
+                    if key in aa:
+                        _check_action(aa[key], f"Page {page_num} {trigger}")
+
+        # Check annotations
+        annotations = page_dict.get("/Annots")
+        if annotations is None:
+            continue
+
+        if hasattr(annotations, "get_object"):
+            annotations = annotations.get_object()
+
+        if isinstance(annotations, ArrayObject):
+            annot_list = annotations
+        else:
+            annot_list = [annotations]
+
+        for annot_idx, annot_ref in enumerate(annot_list, start=1):
+            annot = annot_ref.get_object() if hasattr(annot_ref, "get_object") else annot_ref
+            if not isinstance(annot, DictionaryObject):
+                continue
+
+            location = f"Page {page_num} Annotation {annot_idx}"
+
+            # Check /A (action)
+            if "/A" in annot:
+                _check_action(annot["/A"], location)
+
+            # Check /AA (additional actions)
+            if "/AA" in annot:
+                aa = annot["/AA"]
+                if hasattr(aa, "get_object"):
+                    aa = aa.get_object()
+                if isinstance(aa, DictionaryObject):
+                    for key, trigger in [
+                        ("/E", "Mouse Enter"),
+                        ("/X", "Mouse Exit"),
+                        ("/D", "Mouse Down"),
+                        ("/U", "Mouse Up"),
+                        ("/Fo", "Focus"),
+                        ("/Bl", "Blur"),
+                        ("/K", "Keystroke"),
+                        ("/F", "Format"),
+                        ("/V", "Validate"),
+                        ("/C", "Calculate"),
+                    ]:
+                        if key in aa:
+                            _check_action(aa[key], f"{location} {trigger}")
+
+    return javascript_found
 
 
 def _extract_additional_actions(

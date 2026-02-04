@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from woodchipper.core import validate_pdf, process, get_urls, get_pdf_metadata, check_anomalies, detect_additionalactions, detect_external_actions, extract_forms, ValidationError
+from woodchipper.core import validate_pdf, process, get_urls, get_pdf_metadata, check_anomalies, detect_additionalactions, detect_external_actions, detect_javascript, extract_forms, ValidationError
 
 
 def test_validate_pdf_file_not_found():
@@ -107,10 +107,12 @@ startxref
         assert "anomalies" in anomalies_section
         assert "additional_actions_detected" in anomalies_section
         assert "external_actions" in anomalies_section
+        assert "javascript_detected" in anomalies_section
         assert isinstance(anomalies_section["anomalies_present"], bool)
         assert isinstance(anomalies_section["anomalies"], list)
         assert isinstance(anomalies_section["additional_actions_detected"], list)
         assert isinstance(anomalies_section["external_actions"], list)
+        assert isinstance(anomalies_section["javascript_detected"], list)
 
         # Verify forms structure
         assert "forms" in report
@@ -917,3 +919,187 @@ def test_check_anomalies_includes_external_actions():
         assert "external_actions" in anomalies
         assert len(anomalies["external_actions"]) > 0
         assert any("/Launch" in action for action in anomalies["external_actions"])
+
+
+def test_detect_javascript_no_js():
+    """Test detect_javascript with a PDF that has no JavaScript."""
+    pdf_content = b"""%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj
+3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj
+xref
+0 4
+0000000000 65535 f
+0000000009 00000 n
+0000000052 00000 n
+0000000101 00000 n
+trailer<</Size 4/Root 1 0 R>>
+startxref
+167
+%%EOF"""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_content)
+        f.flush()
+        result = detect_javascript(f.name)
+
+        assert result == []
+
+
+def test_detect_javascript_with_alert():
+    """Test detect_javascript with a PDF containing JavaScript alert."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    # Add an OpenAction with JavaScript
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('Hello World');"),
+    })
+
+    writer._root_object[NameObject("/OpenAction")] = js_action
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_javascript(f.name)
+
+        assert len(result) > 0
+        assert any("displays alert" in js for js in result)
+        assert any("app.alert" in js for js in result)
+
+
+def test_detect_javascript_with_url_launch():
+    """Test detect_javascript with a PDF containing JavaScript that launches URL."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    # Add an OpenAction with JavaScript that launches URL
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.launchURL('http://malicious.com');"),
+    })
+
+    writer._root_object[NameObject("/OpenAction")] = js_action
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_javascript(f.name)
+
+        assert len(result) > 0
+        assert any("launches URL" in js for js in result)
+
+
+def test_detect_javascript_with_eval():
+    """Test detect_javascript with a PDF containing JavaScript eval."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    # Add an OpenAction with JavaScript using eval
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("var x = eval(someCode);"),
+    })
+
+    writer._root_object[NameObject("/OpenAction")] = js_action
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_javascript(f.name)
+
+        assert len(result) > 0
+        assert any("evaluates dynamic code" in js for js in result)
+
+
+def test_detect_javascript_with_obfuscation():
+    """Test detect_javascript detects obfuscated code patterns."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    # Add JavaScript with obfuscation patterns
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("var s = unescape('%41%42%43');"),
+    })
+
+    writer._root_object[NameObject("/OpenAction")] = js_action
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_javascript(f.name)
+
+        assert len(result) > 0
+        assert any("decodes obfuscated content" in js for js in result)
+
+
+def test_detect_javascript_invalid_file():
+    """Test detect_javascript with an invalid file."""
+    with pytest.raises(ValidationError):
+        detect_javascript("/nonexistent/file.pdf")
+
+
+def test_check_anomalies_includes_javascript():
+    """Test that check_anomalies includes javascript_detected."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    # Add an OpenAction with JavaScript
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('Malicious');"),
+    })
+
+    writer._root_object[NameObject("/OpenAction")] = js_action
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        anomalies = check_anomalies(f.name)
+
+        # Should have anomalies_present=True due to JavaScript
+        assert anomalies["anomalies_present"] is True
+        assert "javascript_detected" in anomalies
+        assert len(anomalies["javascript_detected"]) > 0
+        assert any("alert" in js for js in anomalies["javascript_detected"])
