@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from woodchipper.core import validate_pdf, process, get_urls, get_pdf_metadata, check_anomalies, detect_additionalactions, extract_forms, ValidationError
+from woodchipper.core import validate_pdf, process, get_urls, get_pdf_metadata, check_anomalies, detect_additionalactions, detect_external_actions, extract_forms, ValidationError
 
 
 def test_validate_pdf_file_not_found():
@@ -106,9 +106,11 @@ startxref
         assert "anomalies_present" in anomalies_section
         assert "anomalies" in anomalies_section
         assert "additional_actions_detected" in anomalies_section
+        assert "external_actions" in anomalies_section
         assert isinstance(anomalies_section["anomalies_present"], bool)
         assert isinstance(anomalies_section["anomalies"], list)
         assert isinstance(anomalies_section["additional_actions_detected"], list)
+        assert isinstance(anomalies_section["external_actions"], list)
 
         # Verify forms structure
         assert "forms" in report
@@ -707,3 +709,211 @@ def test_check_anomalies_includes_additional_actions():
         assert anomalies["anomalies_present"] is True
         assert "additional_actions_detected" in anomalies
         assert len(anomalies["additional_actions_detected"]) > 0
+
+
+def test_detect_external_actions_no_actions():
+    """Test detect_external_actions with a PDF that has no external actions."""
+    pdf_content = b"""%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj
+3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj
+xref
+0 4
+0000000000 65535 f
+0000000009 00000 n
+0000000052 00000 n
+0000000101 00000 n
+trailer<</Size 4/Root 1 0 R>>
+startxref
+167
+%%EOF"""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_content)
+        f.flush()
+        result = detect_external_actions(f.name)
+
+        assert result == []
+
+
+def test_detect_external_actions_with_uri():
+    """Test detect_external_actions with a PDF containing /URI action."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        NumberObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+
+    # Create a link annotation with URI action
+    link = DictionaryObject({
+        NameObject("/Type"): NameObject("/Annot"),
+        NameObject("/Subtype"): NameObject("/Link"),
+        NameObject("/Rect"): ArrayObject([
+            NumberObject(100), NumberObject(700),
+            NumberObject(200), NumberObject(720),
+        ]),
+        NameObject("/A"): DictionaryObject({
+            NameObject("/Type"): NameObject("/Action"),
+            NameObject("/S"): NameObject("/URI"),
+            NameObject("/URI"): TextStringObject("https://example.com/test"),
+        }),
+    })
+
+    page[NameObject("/Annots")] = ArrayObject([link])
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_external_actions(f.name)
+
+        assert len(result) > 0
+        assert any("/URI" in action for action in result)
+        assert any("https://example.com/test" in action for action in result)
+
+
+def test_detect_external_actions_with_launch():
+    """Test detect_external_actions with a PDF containing /Launch action."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    # Add an OpenAction with Launch
+    launch_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/Launch"),
+        NameObject("/F"): TextStringObject("cmd.exe"),
+    })
+
+    writer._root_object[NameObject("/OpenAction")] = launch_action
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_external_actions(f.name)
+
+        assert len(result) > 0
+        assert any("/Launch" in action for action in result)
+        assert any("cmd.exe" in action for action in result)
+
+
+def test_detect_external_actions_with_gotor():
+    """Test detect_external_actions with a PDF containing /GoToR action."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        NumberObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+
+    # Create a link annotation with GoToR action
+    link = DictionaryObject({
+        NameObject("/Type"): NameObject("/Annot"),
+        NameObject("/Subtype"): NameObject("/Link"),
+        NameObject("/Rect"): ArrayObject([
+            NumberObject(100), NumberObject(700),
+            NumberObject(200), NumberObject(720),
+        ]),
+        NameObject("/A"): DictionaryObject({
+            NameObject("/Type"): NameObject("/Action"),
+            NameObject("/S"): NameObject("/GoToR"),
+            NameObject("/F"): TextStringObject("remote.pdf"),
+        }),
+    })
+
+    page[NameObject("/Annots")] = ArrayObject([link])
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_external_actions(f.name)
+
+        assert len(result) > 0
+        assert any("/GoToR" in action for action in result)
+        assert any("remote.pdf" in action for action in result)
+
+
+def test_detect_external_actions_with_gotoe():
+    """Test detect_external_actions with a PDF containing /GoToE action."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    # Add an OpenAction with GoToE
+    gotoe_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/GoToE"),
+        NameObject("/F"): TextStringObject("embedded.pdf"),
+        NameObject("/T"): TextStringObject("target"),
+    })
+
+    writer._root_object[NameObject("/OpenAction")] = gotoe_action
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_external_actions(f.name)
+
+        assert len(result) > 0
+        assert any("/GoToE" in action for action in result)
+        assert any("embedded" in action for action in result)
+
+
+def test_detect_external_actions_invalid_file():
+    """Test detect_external_actions with an invalid file."""
+    with pytest.raises(ValidationError):
+        detect_external_actions("/nonexistent/file.pdf")
+
+
+def test_check_anomalies_includes_external_actions():
+    """Test that check_anomalies includes external_actions."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    # Add an OpenAction with Launch
+    launch_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/Launch"),
+        NameObject("/F"): TextStringObject("malware.exe"),
+    })
+
+    writer._root_object[NameObject("/OpenAction")] = launch_action
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        anomalies = check_anomalies(f.name)
+
+        # Should have anomalies_present=True due to external actions
+        assert anomalies["anomalies_present"] is True
+        assert "external_actions" in anomalies
+        assert len(anomalies["external_actions"]) > 0
+        assert any("/Launch" in action for action in anomalies["external_actions"])

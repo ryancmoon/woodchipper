@@ -2,7 +2,7 @@
 
 All PDF files must be fed to the woodchipper.
 
-A Python library and CLI tool for analyzing PDF files. Extracts metadata, computes file hashes, finds embedded URLs, detects forms, and identifies suspicious actions and anomalies. All URLs in output are automatically defanged for safe handling.
+A Python library and CLI tool for analyzing PDF files. Extracts metadata, computes file hashes, finds embedded URLs, detects forms, and identifies suspicious actions and anomalies. All string fields in output are automatically defanged for safe handling.
 
 ## Installation
 
@@ -28,7 +28,7 @@ pip install -e .
 woodchipper <path-to-pdf>
 ```
 
-Output is JSON with defanged URLs:
+Output is JSON with all string fields defanged:
 
 ```json
 {
@@ -58,6 +58,10 @@ Output is JSON with defanged URLs:
     ],
     "additional_actions_detected": [
       "Document Open: JavaScript execution (code: app.alert('Hello');...)"
+    ],
+    "external_actions": [
+      "/Launch at Document OpenAction: Launches external application (file: cmd.exe)",
+      "/URI at Page 1 Annotation 1: Opens URL (hXXps://malicious[.]com)"
     ]
   },
   "forms": {
@@ -87,9 +91,10 @@ print(report["sha256"])
 print(report["urls"])  # Defanged URLs
 print(report["metadata"]["spoofing_indicators"])
 print(report["anomalies"]["additional_actions_detected"])
+print(report["anomalies"]["external_actions"])
 ```
 
-**Note:** All URLs in the returned report are defanged for safe handling.
+**Note:** All string fields in the returned report are defanged for safe handling.
 
 ### `get_urls(file_path) -> list[str]`
 
@@ -141,6 +146,8 @@ if anomalies["anomalies_present"]:
         print(f"Anomaly: {anomaly}")
     for action in anomalies["additional_actions_detected"]:
         print(f"Action: {action}")
+    for external in anomalies["external_actions"]:
+        print(f"External: {external}")
 ```
 
 **Detects:**
@@ -150,6 +157,7 @@ if anomalies["anomalies_present"]:
 - Missing %%EOF marker
 - Data after %%EOF (appended content)
 - `/OpenAction` and `/AA` (Additional Actions) triggers
+- External actions (`/Launch`, `/URI`, `/GoToR`, `/GoToE`)
 
 ### `detect_additionalactions(file_path) -> list[str]`
 
@@ -173,6 +181,32 @@ for action in actions:
 - Open URL
 - Submit form data
 - And more
+
+### `detect_external_actions(file_path) -> list[str]`
+
+Detect external action tags that access resources outside the PDF.
+
+```python
+from woodchipper import detect_external_actions
+
+actions = detect_external_actions("document.pdf")
+for action in actions:
+    print(action)
+```
+
+**Detects:**
+- `/Launch` - Launches external applications (e.g., `cmd.exe`, executables)
+- `/URI` - Opens URLs in browser
+- `/GoToR` - Opens remote PDF documents
+- `/GoToE` - Opens embedded documents
+
+**Output format:**
+```
+/Launch at Document OpenAction: Launches external application (file: cmd.exe)
+/URI at Page 1 Annotation 1: Opens URL (https://example.com)
+/GoToR at Page 2 Annotation 3: Opens remote PDF document (file: remote.pdf)
+/GoToE at Document OpenAction: Opens embedded document (file: embedded.pdf)
+```
 
 ### `extract_forms(file_path) -> PdfForms`
 
@@ -250,6 +284,10 @@ Exception raised when file validation fails:
           "items": { "type": "string" }
         },
         "additional_actions_detected": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "external_actions": {
           "type": "array",
           "items": { "type": "string" }
         }

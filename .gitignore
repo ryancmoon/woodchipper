@@ -30,6 +30,7 @@ ENV/
 .vscode/
 *.swp
 *.swo
+.claude/
 
 # Testing
 .pytest_cache/
@@ -40,3 +41,4 @@ htmlcov/
 # Distribution
 *.tar.gz
 *.whl
+

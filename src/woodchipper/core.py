@@ -32,6 +32,7 @@ class PdfAnomalies(TypedDict):
     anomalies_present: bool
     anomalies: list[str]
     additional_actions_detected: list[str]
+    external_actions: list[str]
 
 
 class PdfForms(TypedDict):
@@ -397,12 +398,16 @@ def check_anomalies(file_path: str | Path) -> PdfAnomalies:
     # Detect additional actions
     additional_actions = detect_additionalactions(path)
 
-    has_anomalies = bool(anomalies) or bool(additional_actions)
+    # Detect external actions
+    external_actions = detect_external_actions(path)
+
+    has_anomalies = bool(anomalies) or bool(additional_actions) or bool(external_actions)
 
     return PdfAnomalies(
         anomalies_present=has_anomalies,
         anomalies=anomalies,
         additional_actions_detected=additional_actions,
+        external_actions=external_actions,
     )
 
 
@@ -464,6 +469,204 @@ def detect_additionalactions(file_path: str | Path) -> list[str]:
                 _extract_additional_actions(aa, f"Page {i}", actions_found)
 
     return actions_found
+
+
+def detect_external_actions(file_path: str | Path) -> list[str]:
+    """Detect external action tags (/Launch, /URI, /GoToR, /GoToE) in a PDF.
+
+    These actions can cause the PDF reader to access external resources,
+    launch applications, or navigate to remote documents.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        List of detected external actions with descriptions of what they do.
+
+    Raises:
+        ValidationError: If the file isn't a valid, readable PDF.
+    """
+    path = validate_pdf(file_path)
+    external_actions: list[str] = []
+
+    try:
+        reader = PdfReader(str(path))
+    except Exception:
+        # PDF is too malformed to parse
+        return []
+
+    def _scan_for_external_actions(obj: DictionaryObject, location: str) -> None:
+        """Recursively scan a dictionary for external action types."""
+        action_type = obj.get("/S")
+        if action_type:
+            action_type_str = str(action_type)
+
+            if action_type_str == "/Launch":
+                details = []
+                if "/F" in obj:
+                    details.append(f"file: {obj['/F']}")
+                if "/Win" in obj:
+                    win = obj["/Win"]
+                    if hasattr(win, "get_object"):
+                        win = win.get_object()
+                    if isinstance(win, DictionaryObject):
+                        if "/F" in win:
+                            details.append(f"file: {win['/F']}")
+                        if "/P" in win:
+                            details.append(f"params: {win['/P']}")
+                detail_str = f" ({', '.join(details)})" if details else ""
+                external_actions.append(
+                    f"/Launch at {location}: Launches external application{detail_str}"
+                )
+
+            elif action_type_str == "/URI":
+                uri = obj.get("/URI", "unknown")
+                external_actions.append(
+                    f"/URI at {location}: Opens URL ({uri})"
+                )
+
+            elif action_type_str == "/GoToR":
+                details = []
+                if "/F" in obj:
+                    f_val = obj["/F"]
+                    if hasattr(f_val, "get_object"):
+                        f_val = f_val.get_object()
+                    if isinstance(f_val, DictionaryObject):
+                        if "/F" in f_val:
+                            details.append(f"file: {f_val['/F']}")
+                        elif "/UF" in f_val:
+                            details.append(f"file: {f_val['/UF']}")
+                    else:
+                        details.append(f"file: {f_val}")
+                detail_str = f" ({', '.join(details)})" if details else ""
+                external_actions.append(
+                    f"/GoToR at {location}: Opens remote PDF document{detail_str}"
+                )
+
+            elif action_type_str == "/GoToE":
+                details = []
+                if "/F" in obj:
+                    f_val = obj["/F"]
+                    if hasattr(f_val, "get_object"):
+                        f_val = f_val.get_object()
+                    if isinstance(f_val, DictionaryObject):
+                        if "/F" in f_val:
+                            details.append(f"file: {f_val['/F']}")
+                        elif "/UF" in f_val:
+                            details.append(f"file: {f_val['/UF']}")
+                    else:
+                        details.append(f"file: {f_val}")
+                if "/T" in obj:
+                    details.append(f"target: {obj['/T']}")
+                detail_str = f" ({', '.join(details)})" if details else ""
+                external_actions.append(
+                    f"/GoToE at {location}: Opens embedded document{detail_str}"
+                )
+
+        # Check /Next for chained actions
+        if "/Next" in obj:
+            next_action = obj["/Next"]
+            if hasattr(next_action, "get_object"):
+                next_action = next_action.get_object()
+            if isinstance(next_action, DictionaryObject):
+                _scan_for_external_actions(next_action, f"{location} (chained)")
+            elif isinstance(next_action, ArrayObject):
+                for i, item in enumerate(next_action):
+                    item_obj = item.get_object() if hasattr(item, "get_object") else item
+                    if isinstance(item_obj, DictionaryObject):
+                        _scan_for_external_actions(item_obj, f"{location} (chained {i+1})")
+
+    def _check_action_dict(action, location: str) -> None:
+        """Check an action object for external actions."""
+        if hasattr(action, "get_object"):
+            action = action.get_object()
+        if isinstance(action, DictionaryObject):
+            _scan_for_external_actions(action, location)
+
+    # Check document catalog for /OpenAction
+    if reader.trailer and "/Root" in reader.trailer:
+        root = reader.trailer["/Root"]
+        if hasattr(root, "get_object"):
+            root = root.get_object()
+
+        if isinstance(root, DictionaryObject):
+            if "/OpenAction" in root:
+                _check_action_dict(root["/OpenAction"], "Document OpenAction")
+
+            # Check document-level /AA
+            if "/AA" in root:
+                aa = root["/AA"]
+                if hasattr(aa, "get_object"):
+                    aa = aa.get_object()
+                if isinstance(aa, DictionaryObject):
+                    for key, trigger in [
+                        ("/WC", "Will Close"),
+                        ("/WS", "Will Save"),
+                        ("/DS", "Did Save"),
+                        ("/WP", "Will Print"),
+                        ("/DP", "Did Print"),
+                    ]:
+                        if key in aa:
+                            _check_action_dict(aa[key], f"Document AA {trigger}")
+
+    # Check each page
+    for page_num, page in enumerate(reader.pages, start=1):
+        page_dict = page.get_object() if hasattr(page, "get_object") else page
+        if not isinstance(page_dict, DictionaryObject):
+            continue
+
+        # Check page-level /AA
+        if "/AA" in page_dict:
+            aa = page_dict["/AA"]
+            if hasattr(aa, "get_object"):
+                aa = aa.get_object()
+            if isinstance(aa, DictionaryObject):
+                for key, trigger in [("/O", "Open"), ("/C", "Close")]:
+                    if key in aa:
+                        _check_action_dict(aa[key], f"Page {page_num} AA {trigger}")
+
+        # Check annotations
+        annotations = page_dict.get("/Annots")
+        if annotations is None:
+            continue
+
+        if hasattr(annotations, "get_object"):
+            annotations = annotations.get_object()
+
+        if isinstance(annotations, ArrayObject):
+            annot_list = annotations
+        else:
+            annot_list = [annotations]
+
+        for annot_idx, annot_ref in enumerate(annot_list, start=1):
+            annot = annot_ref.get_object() if hasattr(annot_ref, "get_object") else annot_ref
+            if not isinstance(annot, DictionaryObject):
+                continue
+
+            location = f"Page {page_num} Annotation {annot_idx}"
+
+            # Check /A (action)
+            if "/A" in annot:
+                _check_action_dict(annot["/A"], location)
+
+            # Check /AA (additional actions)
+            if "/AA" in annot:
+                aa = annot["/AA"]
+                if hasattr(aa, "get_object"):
+                    aa = aa.get_object()
+                if isinstance(aa, DictionaryObject):
+                    for key, trigger in [
+                        ("/E", "Enter"),
+                        ("/X", "Exit"),
+                        ("/D", "MouseDown"),
+                        ("/U", "MouseUp"),
+                        ("/Fo", "Focus"),
+                        ("/Bl", "Blur"),
+                    ]:
+                        if key in aa:
+                            _check_action_dict(aa[key], f"{location} AA {trigger}")
+
+    return external_actions
 
 
 def _extract_additional_actions(
@@ -737,6 +940,28 @@ def _process_action(action: DictionaryObject, targets: set[str]) -> None:
                     _process_action(item_obj, targets)
 
 
+def _defang_value(value):
+    """Recursively defang all string values in a data structure.
+
+    Args:
+        value: A value that may be a string, list, dict, or primitive.
+
+    Returns:
+        The value with all strings defanged.
+    """
+    if value is None:
+        return None
+    elif isinstance(value, str):
+        return defang.defang(value)
+    elif isinstance(value, list):
+        return [_defang_value(item) for item in value]
+    elif isinstance(value, dict):
+        return {key: _defang_value(val) for key, val in value.items()}
+    else:
+        # int, bool, float, etc. - return as-is
+        return value
+
+
 def compute_hashes(file_path: Path) -> tuple[str, str, str]:
     """Compute MD5, SHA1, and SHA256 hashes of a file.
 
@@ -762,7 +987,7 @@ def compute_hashes(file_path: Path) -> tuple[str, str, str]:
 def process(file_path: str | Path) -> PdfReport:
     """Process a PDF file and generate a report.
 
-    All URLs in the output are defanged for safe handling.
+    All string fields in the output are defanged for safe handling.
 
     Args:
         file_path: Path to the PDF file to process.
@@ -782,23 +1007,18 @@ def process(file_path: str | Path) -> PdfReport:
     anomalies = check_anomalies(path)
     forms = extract_forms(path)
 
-    # Defang all URLs for safe handling
-    defanged_urls = [defang.defang(url) for url in urls]
-    defanged_form_targets = [
-        defang.defang(url) for url in forms["form_submission_targets"]
-    ]
-
-    return PdfReport(
+    # Build the report
+    report = PdfReport(
         filename=path.name,
         filesize=path.stat().st_size,
         md5=md5,
         sha1=sha1,
         sha256=sha256,
-        urls=defanged_urls,
+        urls=urls,
         metadata=metadata,
         anomalies=anomalies,
-        forms=PdfForms(
-            forms_present=forms["forms_present"],
-            form_submission_targets=defanged_form_targets,
-        ),
+        forms=forms,
     )
+
+    # Defang all string fields for safe handling
+    return _defang_value(report)
