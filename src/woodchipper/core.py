@@ -26,6 +26,16 @@ class PdfMetadata(TypedDict):
     spoofing_indicators: list[str]
 
 
+class EmbeddedFile(TypedDict):
+    """Information about an embedded file in a PDF."""
+
+    name: str | None
+    file_type: str | None
+    mime_type: str | None
+    size: int | None
+    description: str | None
+
+
 class PdfAnomalies(TypedDict):
     """Anomaly detection results for a PDF file."""
 
@@ -34,6 +44,7 @@ class PdfAnomalies(TypedDict):
     additional_actions_detected: list[str]
     external_actions: list[str]
     javascript_detected: list[str]
+    embedded_files: list[EmbeddedFile]
 
 
 class PdfForms(TypedDict):
@@ -405,11 +416,15 @@ def check_anomalies(file_path: str | Path) -> PdfAnomalies:
     # Detect JavaScript
     javascript = detect_javascript(path)
 
+    # Detect embedded files
+    embedded = detect_embedded_file(path)
+
     has_anomalies = (
         bool(anomalies)
         or bool(additional_actions)
         or bool(external_actions)
         or bool(javascript)
+        or bool(embedded)
     )
 
     return PdfAnomalies(
@@ -418,6 +433,7 @@ def check_anomalies(file_path: str | Path) -> PdfAnomalies:
         additional_actions_detected=additional_actions,
         external_actions=external_actions,
         javascript_detected=javascript,
+        embedded_files=embedded,
     )
 
 
@@ -922,6 +938,217 @@ def detect_javascript(file_path: str | Path) -> list[str]:
                             _check_action(aa[key], f"{location} {trigger}")
 
     return javascript_found
+
+
+def detect_embedded_file(file_path: str | Path) -> list[EmbeddedFile]:
+    """Detect embedded files in a PDF.
+
+    Scans for /EmbeddedFile, /FileSpec, and related tags to find
+    files attached or embedded within the PDF.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        List of EmbeddedFile dicts with name, file_type, mime_type, size, description.
+
+    Raises:
+        ValidationError: If the file isn't a valid, readable PDF.
+    """
+    path = validate_pdf(file_path)
+    embedded_files: list[EmbeddedFile] = []
+
+    try:
+        reader = PdfReader(str(path))
+    except Exception:
+        # PDF is too malformed to parse
+        return []
+
+    def _get_mime_from_data(data: bytes) -> str | None:
+        """Determine MIME type from file data using magic bytes."""
+        try:
+            return magic.from_buffer(data, mime=True)
+        except Exception:
+            return None
+
+    def _get_file_type_from_data(data: bytes) -> str | None:
+        """Determine file type description from file data."""
+        try:
+            return magic.from_buffer(data)
+        except Exception:
+            return None
+
+    def _process_filespec(filespec: DictionaryObject, location: str) -> None:
+        """Process a FileSpec dictionary to extract embedded file info."""
+        # Get the filename
+        name = None
+        for key in ["/UF", "/F", "/Unix", "/DOS", "/Mac"]:
+            if key in filespec:
+                name = str(filespec[key])
+                break
+
+        # Get description if available
+        description = None
+        if "/Desc" in filespec:
+            description = str(filespec["/Desc"])
+
+        # Check for embedded file stream in /EF dictionary
+        if "/EF" in filespec:
+            ef = filespec["/EF"]
+            if hasattr(ef, "get_object"):
+                ef = ef.get_object()
+
+            if isinstance(ef, DictionaryObject):
+                # Try different keys for the embedded file stream
+                for key in ["/UF", "/F", "/Unix", "/DOS", "/Mac"]:
+                    if key in ef:
+                        stream = ef[key]
+                        if hasattr(stream, "get_object"):
+                            stream = stream.get_object()
+
+                        # Extract file data and metadata
+                        size = None
+                        mime_type = None
+                        file_type = None
+
+                        # Get size from Params if available
+                        if hasattr(stream, "get") and "/Params" in stream:
+                            params = stream["/Params"]
+                            if hasattr(params, "get_object"):
+                                params = params.get_object()
+                            if isinstance(params, DictionaryObject):
+                                if "/Size" in params:
+                                    try:
+                                        size = int(params["/Size"])
+                                    except (ValueError, TypeError):
+                                        pass
+
+                        # Try to get actual data for magic detection
+                        if hasattr(stream, "get_data"):
+                            try:
+                                data = stream.get_data()
+                                if size is None:
+                                    size = len(data)
+                                mime_type = _get_mime_from_data(data)
+                                file_type = _get_file_type_from_data(data)
+                            except Exception:
+                                pass
+
+                        embedded_files.append(EmbeddedFile(
+                            name=name,
+                            file_type=file_type,
+                            mime_type=mime_type,
+                            size=size,
+                            description=description,
+                        ))
+                        break
+        else:
+            # FileSpec without embedded data (external reference)
+            embedded_files.append(EmbeddedFile(
+                name=name,
+                file_type=None,
+                mime_type=None,
+                size=None,
+                description=description or "External file reference",
+            ))
+
+    def _process_annotation_filespec(annot: DictionaryObject, location: str) -> None:
+        """Process file attachment annotations."""
+        if "/FS" in annot:
+            fs = annot["/FS"]
+            if hasattr(fs, "get_object"):
+                fs = fs.get_object()
+            if isinstance(fs, DictionaryObject):
+                _process_filespec(fs, location)
+
+    # Check Names tree for EmbeddedFiles
+    if reader.trailer and "/Root" in reader.trailer:
+        root = reader.trailer["/Root"]
+        if hasattr(root, "get_object"):
+            root = root.get_object()
+
+        if isinstance(root, DictionaryObject):
+            # Check /Names dictionary
+            if "/Names" in root:
+                names = root["/Names"]
+                if hasattr(names, "get_object"):
+                    names = names.get_object()
+
+                if isinstance(names, DictionaryObject):
+                    # Check for /EmbeddedFiles name tree
+                    if "/EmbeddedFiles" in names:
+                        ef_tree = names["/EmbeddedFiles"]
+                        if hasattr(ef_tree, "get_object"):
+                            ef_tree = ef_tree.get_object()
+
+                        if isinstance(ef_tree, DictionaryObject):
+                            # Process /Names array
+                            if "/Names" in ef_tree:
+                                names_array = ef_tree["/Names"]
+                                if hasattr(names_array, "get_object"):
+                                    names_array = names_array.get_object()
+                                if isinstance(names_array, ArrayObject):
+                                    # Names array: [name1, filespec1, name2, filespec2, ...]
+                                    for i in range(0, len(names_array), 2):
+                                        if i + 1 < len(names_array):
+                                            filespec = names_array[i + 1]
+                                            if hasattr(filespec, "get_object"):
+                                                filespec = filespec.get_object()
+                                            if isinstance(filespec, DictionaryObject):
+                                                _process_filespec(filespec, "EmbeddedFiles Name Tree")
+
+                            # Process /Kids array (for large name trees)
+                            if "/Kids" in ef_tree:
+                                kids = ef_tree["/Kids"]
+                                if hasattr(kids, "get_object"):
+                                    kids = kids.get_object()
+                                if isinstance(kids, ArrayObject):
+                                    for kid in kids:
+                                        kid_obj = kid.get_object() if hasattr(kid, "get_object") else kid
+                                        if isinstance(kid_obj, DictionaryObject) and "/Names" in kid_obj:
+                                            names_array = kid_obj["/Names"]
+                                            if hasattr(names_array, "get_object"):
+                                                names_array = names_array.get_object()
+                                            if isinstance(names_array, ArrayObject):
+                                                for i in range(0, len(names_array), 2):
+                                                    if i + 1 < len(names_array):
+                                                        filespec = names_array[i + 1]
+                                                        if hasattr(filespec, "get_object"):
+                                                            filespec = filespec.get_object()
+                                                        if isinstance(filespec, DictionaryObject):
+                                                            _process_filespec(filespec, "EmbeddedFiles Name Tree")
+
+    # Check page annotations for file attachments
+    for page_num, page in enumerate(reader.pages, start=1):
+        page_dict = page.get_object() if hasattr(page, "get_object") else page
+        if not isinstance(page_dict, DictionaryObject):
+            continue
+
+        annotations = page_dict.get("/Annots")
+        if annotations is None:
+            continue
+
+        if hasattr(annotations, "get_object"):
+            annotations = annotations.get_object()
+
+        if isinstance(annotations, ArrayObject):
+            annot_list = annotations
+        else:
+            annot_list = [annotations]
+
+        for annot_idx, annot_ref in enumerate(annot_list, start=1):
+            annot = annot_ref.get_object() if hasattr(annot_ref, "get_object") else annot_ref
+            if not isinstance(annot, DictionaryObject):
+                continue
+
+            subtype = annot.get("/Subtype")
+            location = f"Page {page_num} Annotation {annot_idx}"
+
+            # FileAttachment annotation
+            if subtype == "/FileAttachment":
+                _process_annotation_filespec(annot, location)
+
+    return embedded_files
 
 
 def _extract_additional_actions(

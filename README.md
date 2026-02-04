@@ -65,6 +65,15 @@ Output is JSON with all string fields defanged:
     ],
     "javascript_detected": [
       "Document OpenAction: displays alert (code: app.alert('Hello');)"
+    ],
+    "embedded_files": [
+      {
+        "name": "malware.exe",
+        "file_type": "PE32 executable (GUI) Intel 80386",
+        "mime_type": "application/x-dosexec",
+        "size": 45056,
+        "description": "Click to open"
+      }
     ]
   },
   "forms": {
@@ -96,6 +105,7 @@ print(report["metadata"]["spoofing_indicators"])
 print(report["anomalies"]["additional_actions_detected"])
 print(report["anomalies"]["external_actions"])
 print(report["anomalies"]["javascript_detected"])
+print(report["anomalies"]["embedded_files"])
 ```
 
 **Note:** All string fields in the returned report are defanged for safe handling.
@@ -154,6 +164,8 @@ if anomalies["anomalies_present"]:
         print(f"External: {external}")
     for js in anomalies["javascript_detected"]:
         print(f"JavaScript: {js}")
+    for ef in anomalies["embedded_files"]:
+        print(f"Embedded: {ef['name']} ({ef['mime_type']})")
 ```
 
 **Detects:**
@@ -165,6 +177,7 @@ if anomalies["anomalies_present"]:
 - `/OpenAction` and `/AA` (Additional Actions) triggers
 - External actions (`/Launch`, `/URI`, `/GoToR`, `/GoToE`)
 - Embedded JavaScript with behavior analysis
+- Embedded files with file type detection
 
 ### `detect_additionalactions(file_path) -> list[str]`
 
@@ -250,6 +263,44 @@ for script in scripts:
 Document OpenAction: displays alert (code: app.alert('Hello World');)
 Page 1 Annotation 1 Mouse Down: launches URL; evaluates dynamic code (code: var url = eval(x); app.launchURL(url);...)
 Named JavaScript 'init': defines function; contains URL reference (code: function init() { ... }...)
+```
+
+### `detect_embedded_file(file_path) -> list[EmbeddedFile]`
+
+Detect files embedded or attached to a PDF.
+
+```python
+from woodchipper import detect_embedded_file
+
+files = detect_embedded_file("document.pdf")
+for f in files:
+    print(f"Name: {f['name']}")
+    print(f"Type: {f['file_type']}")
+    print(f"MIME: {f['mime_type']}")
+    print(f"Size: {f['size']} bytes")
+```
+
+**Detects embedded files in:**
+- `/Names` tree `/EmbeddedFiles` entries
+- `/FileSpec` dictionaries with `/EF` streams
+- `/FileAttachment` annotations
+
+**Returns `EmbeddedFile` dict with:**
+- `name` - Filename from the PDF
+- `file_type` - File type description (from magic bytes)
+- `mime_type` - MIME type (from magic bytes)
+- `size` - File size in bytes
+- `description` - Description from PDF metadata
+
+**Output format:**
+```json
+{
+  "name": "document.docx",
+  "file_type": "Microsoft Word 2007+",
+  "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "size": 15234,
+  "description": "Original document"
+}
 ```
 
 ### `extract_forms(file_path) -> PdfForms`
@@ -338,6 +389,19 @@ Exception raised when file validation fails:
         "javascript_detected": {
           "type": "array",
           "items": { "type": "string" }
+        },
+        "embedded_files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "type": ["string", "null"] },
+              "file_type": { "type": ["string", "null"] },
+              "mime_type": { "type": ["string", "null"] },
+              "size": { "type": ["integer", "null"] },
+              "description": { "type": ["string", "null"] }
+            }
+          }
         }
       }
     },

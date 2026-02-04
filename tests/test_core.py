@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from woodchipper.core import validate_pdf, process, get_urls, get_pdf_metadata, check_anomalies, detect_additionalactions, detect_external_actions, detect_javascript, extract_forms, ValidationError
+from woodchipper.core import validate_pdf, process, get_urls, get_pdf_metadata, check_anomalies, detect_additionalactions, detect_external_actions, detect_javascript, detect_embedded_file, extract_forms, ValidationError
 
 
 def test_validate_pdf_file_not_found():
@@ -108,11 +108,13 @@ startxref
         assert "additional_actions_detected" in anomalies_section
         assert "external_actions" in anomalies_section
         assert "javascript_detected" in anomalies_section
+        assert "embedded_files" in anomalies_section
         assert isinstance(anomalies_section["anomalies_present"], bool)
         assert isinstance(anomalies_section["anomalies"], list)
         assert isinstance(anomalies_section["additional_actions_detected"], list)
         assert isinstance(anomalies_section["external_actions"], list)
         assert isinstance(anomalies_section["javascript_detected"], list)
+        assert isinstance(anomalies_section["embedded_files"], list)
 
         # Verify forms structure
         assert "forms" in report
@@ -1103,3 +1105,151 @@ def test_check_anomalies_includes_javascript():
         assert "javascript_detected" in anomalies
         assert len(anomalies["javascript_detected"]) > 0
         assert any("alert" in js for js in anomalies["javascript_detected"])
+
+
+def test_detect_embedded_file_no_embedded():
+    """Test detect_embedded_file with a PDF that has no embedded files."""
+    pdf_content = b"""%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj
+3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj
+xref
+0 4
+0000000000 65535 f
+0000000009 00000 n
+0000000052 00000 n
+0000000101 00000 n
+trailer<</Size 4/Root 1 0 R>>
+startxref
+167
+%%EOF"""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_content)
+        f.flush()
+        result = detect_embedded_file(f.name)
+
+        assert result == []
+
+
+def test_detect_embedded_file_with_attachment():
+    """Test detect_embedded_file with a PDF containing an embedded file."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+        NumberObject,
+        ByteStringObject,
+        StreamObject,
+        DecodedStreamObject,
+        create_string_object,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    # Create embedded file content
+    file_content = b"This is a test file content."
+
+    # Create the embedded file stream
+    ef_stream = DecodedStreamObject()
+    ef_stream.set_data(file_content)
+    ef_stream[NameObject("/Type")] = NameObject("/EmbeddedFile")
+    ef_stream[NameObject("/Params")] = DictionaryObject({
+        NameObject("/Size"): NumberObject(len(file_content)),
+    })
+
+    # Create the filespec dictionary
+    filespec = DictionaryObject({
+        NameObject("/Type"): NameObject("/Filespec"),
+        NameObject("/F"): TextStringObject("test.txt"),
+        NameObject("/UF"): TextStringObject("test.txt"),
+        NameObject("/Desc"): TextStringObject("A test text file"),
+        NameObject("/EF"): DictionaryObject({
+            NameObject("/F"): ef_stream,
+        }),
+    })
+
+    # Create the Names dictionary with EmbeddedFiles
+    names_dict = DictionaryObject({
+        NameObject("/EmbeddedFiles"): DictionaryObject({
+            NameObject("/Names"): ArrayObject([
+                TextStringObject("test.txt"),
+                filespec,
+            ]),
+        }),
+    })
+
+    writer._root_object[NameObject("/Names")] = names_dict
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_embedded_file(f.name)
+
+        assert len(result) > 0
+        assert result[0]["name"] == "test.txt"
+        assert result[0]["description"] == "A test text file"
+
+
+def test_detect_embedded_file_invalid_file():
+    """Test detect_embedded_file with an invalid file."""
+    with pytest.raises(ValidationError):
+        detect_embedded_file("/nonexistent/file.pdf")
+
+
+def test_check_anomalies_includes_embedded_files():
+    """Test that check_anomalies includes embedded_files."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+        NumberObject,
+        DecodedStreamObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    # Create embedded file content
+    file_content = b"MZ\x90\x00"  # Fake PE header
+
+    # Create the embedded file stream
+    ef_stream = DecodedStreamObject()
+    ef_stream.set_data(file_content)
+    ef_stream[NameObject("/Type")] = NameObject("/EmbeddedFile")
+
+    # Create the filespec dictionary
+    filespec = DictionaryObject({
+        NameObject("/Type"): NameObject("/Filespec"),
+        NameObject("/F"): TextStringObject("malware.exe"),
+        NameObject("/EF"): DictionaryObject({
+            NameObject("/F"): ef_stream,
+        }),
+    })
+
+    # Create the Names dictionary with EmbeddedFiles
+    names_dict = DictionaryObject({
+        NameObject("/EmbeddedFiles"): DictionaryObject({
+            NameObject("/Names"): ArrayObject([
+                TextStringObject("malware.exe"),
+                filespec,
+            ]),
+        }),
+    })
+
+    writer._root_object[NameObject("/Names")] = names_dict
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        anomalies = check_anomalies(f.name)
+
+        # Should have anomalies_present=True due to embedded files
+        assert anomalies["anomalies_present"] is True
+        assert "embedded_files" in anomalies
+        assert len(anomalies["embedded_files"]) > 0
+        assert anomalies["embedded_files"][0]["name"] == "malware.exe"

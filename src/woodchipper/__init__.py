@@ -11,12 +11,14 @@ from .core import (
     detect_additionalactions,
     detect_external_actions,
     detect_javascript,
+    detect_embedded_file,
     extract_forms,
     ValidationError,
     PdfReport,
     PdfMetadata,
     PdfAnomalies,
     PdfForms,
+    EmbeddedFile,
 )
 
 __all__ = [
@@ -28,11 +30,13 @@ __all__ = [
     "detect_additionalactions",
     "detect_external_actions",
     "detect_javascript",
+    "detect_embedded_file",
     "extract_forms",
     "ValidationError",
     "PdfReport",
     "PdfMetadata",
     "PdfAnomalies",
     "PdfForms",
+    "EmbeddedFile",
     "__version__",
 ]
