@@ -45,6 +45,7 @@ class PdfAnomalies(TypedDict):
     external_actions: list[str]
     javascript_detected: list[str]
     embedded_files: list[EmbeddedFile]
+    acroform_details: list[str]
 
 
 class PdfForms(TypedDict):
@@ -419,12 +420,16 @@ def check_anomalies(file_path: str | Path) -> PdfAnomalies:
     # Detect embedded files
     embedded = detect_embedded_file(path)
 
+    # Detect AcroForm details
+    acroform = detect_acroform(path)
+
     has_anomalies = (
         bool(anomalies)
         or bool(additional_actions)
         or bool(external_actions)
         or bool(javascript)
         or bool(embedded)
+        or bool(acroform)
     )
 
     return PdfAnomalies(
@@ -434,6 +439,7 @@ def check_anomalies(file_path: str | Path) -> PdfAnomalies:
         external_actions=external_actions,
         javascript_detected=javascript,
         embedded_files=embedded,
+        acroform_details=acroform,
     )
 
 
@@ -1149,6 +1155,229 @@ def detect_embedded_file(file_path: str | Path) -> list[EmbeddedFile]:
                 _process_annotation_filespec(annot, location)
 
     return embedded_files
+
+
+def detect_acroform(file_path: str | Path) -> list[str]:
+    """Detect and analyze AcroForm structures in a PDF.
+
+    Scans for /AcroForm tags and provides detailed analysis of form fields,
+    their types, flags, and any potentially suspicious characteristics.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        List of descriptions of AcroForm features found.
+
+    Raises:
+        ValidationError: If the file isn't a valid, readable PDF.
+    """
+    path = validate_pdf(file_path)
+    acroform_details: list[str] = []
+
+    try:
+        reader = PdfReader(str(path))
+    except Exception:
+        # PDF is too malformed to parse
+        return []
+
+    # Field type mapping
+    field_types = {
+        "/Tx": "Text",
+        "/Btn": "Button",
+        "/Ch": "Choice",
+        "/Sig": "Signature",
+    }
+
+    # Field flag bits (Ff field)
+    field_flag_bits = {
+        0: "ReadOnly",
+        1: "Required",
+        2: "NoExport",
+        # Text field specific (bit 12-14, 20-21, 23, 25)
+        12: "Multiline",
+        13: "Password",
+        20: "FileSelect",
+        21: "DoNotSpellCheck",
+        22: "DoNotScroll",
+        23: "Comb",
+        24: "RichText",
+        # Button specific (bit 14-16)
+        14: "NoToggleToOff",
+        15: "Radio",
+        16: "Pushbutton",
+        25: "RadiosInUnison",
+        # Choice specific (bit 17-19, 21-22)
+        17: "Combo",
+        18: "Edit",
+        19: "Sort",
+        26: "CommitOnSelChange",
+    }
+
+    def _get_field_flags(ff_value: int) -> list[str]:
+        """Extract human-readable flags from field flags bitmask."""
+        flags = []
+        for bit, name in field_flag_bits.items():
+            if ff_value & (1 << bit):
+                flags.append(name)
+        return flags
+
+    def _analyze_field(field: DictionaryObject, field_path: str) -> None:
+        """Analyze a form field and its children recursively."""
+        # Get field type
+        field_type = field.get("/FT")
+        field_type_str = field_types.get(str(field_type), str(field_type)) if field_type else "Unknown"
+
+        # Get field name
+        field_name = field.get("/T")
+        name_str = str(field_name) if field_name else "unnamed"
+        current_path = f"{field_path}.{name_str}" if field_path else name_str
+
+        # Get field flags
+        ff = field.get("/Ff")
+        flags = []
+        if ff:
+            try:
+                ff_int = int(ff)
+                flags = _get_field_flags(ff_int)
+            except (ValueError, TypeError):
+                pass
+
+        # Check for actions that could be suspicious
+        has_action = "/A" in field
+        has_aa = "/AA" in field
+
+        # Build description
+        details = []
+        if field_type:
+            details.append(f"type={field_type_str}")
+        if flags:
+            details.append(f"flags=[{', '.join(flags)}]")
+        if has_action:
+            action = field["/A"]
+            if hasattr(action, "get_object"):
+                action = action.get_object()
+            if isinstance(action, DictionaryObject):
+                action_type = action.get("/S")
+                if action_type:
+                    details.append(f"action={action_type}")
+        if has_aa:
+            details.append("has_additional_actions")
+
+        # Check for JavaScript in field actions
+        if has_action or has_aa:
+            js_found = _check_field_for_js(field)
+            if js_found:
+                details.append("contains_javascript")
+
+        if details:
+            acroform_details.append(f"Field '{current_path}': {', '.join(details)}")
+
+        # Process child fields (/Kids array)
+        if "/Kids" in field:
+            kids = field["/Kids"]
+            if hasattr(kids, "get_object"):
+                kids = kids.get_object()
+            if isinstance(kids, ArrayObject):
+                for kid in kids:
+                    kid_obj = kid.get_object() if hasattr(kid, "get_object") else kid
+                    if isinstance(kid_obj, DictionaryObject):
+                        _analyze_field(kid_obj, current_path)
+
+    def _check_field_for_js(field: DictionaryObject) -> bool:
+        """Check if a field contains JavaScript actions."""
+        # Check /A action
+        if "/A" in field:
+            action = field["/A"]
+            if hasattr(action, "get_object"):
+                action = action.get_object()
+            if isinstance(action, DictionaryObject):
+                action_type = action.get("/S")
+                if action_type and str(action_type) in ("/JavaScript", "/JS"):
+                    return True
+
+        # Check /AA additional actions
+        if "/AA" in field:
+            aa = field["/AA"]
+            if hasattr(aa, "get_object"):
+                aa = aa.get_object()
+            if isinstance(aa, DictionaryObject):
+                for key in ["/K", "/F", "/V", "/C", "/E", "/X"]:  # Keystroke, Format, Validate, Calculate, Enter, Exit
+                    if key in aa:
+                        action = aa[key]
+                        if hasattr(action, "get_object"):
+                            action = action.get_object()
+                        if isinstance(action, DictionaryObject):
+                            action_type = action.get("/S")
+                            if action_type and str(action_type) in ("/JavaScript", "/JS"):
+                                return True
+        return False
+
+    # Check document catalog for /AcroForm
+    if reader.trailer and "/Root" in reader.trailer:
+        root = reader.trailer["/Root"]
+        if hasattr(root, "get_object"):
+            root = root.get_object()
+
+        if isinstance(root, DictionaryObject) and "/AcroForm" in root:
+            acro_form = root["/AcroForm"]
+            if hasattr(acro_form, "get_object"):
+                acro_form = acro_form.get_object()
+
+            if isinstance(acro_form, DictionaryObject):
+                acroform_details.append("AcroForm detected in document catalog")
+
+                # Check for XFA (XML Forms Architecture) - can be used for malicious purposes
+                if "/XFA" in acro_form:
+                    acroform_details.append(
+                        "XFA forms detected: XML Forms Architecture present "
+                        "(can contain active content and scripts)"
+                    )
+
+                # Check NeedAppearances flag
+                if "/NeedAppearances" in acro_form:
+                    need_app = acro_form["/NeedAppearances"]
+                    if str(need_app).lower() == "true":
+                        acroform_details.append(
+                            "NeedAppearances=true: Form appearance may be generated dynamically"
+                        )
+
+                # Check SigFlags (signature-related flags)
+                if "/SigFlags" in acro_form:
+                    sig_flags = acro_form["/SigFlags"]
+                    try:
+                        sig_int = int(sig_flags)
+                        sig_details = []
+                        if sig_int & 1:
+                            sig_details.append("SignaturesExist")
+                        if sig_int & 2:
+                            sig_details.append("AppendOnly")
+                        if sig_details:
+                            acroform_details.append(f"Signature flags: {', '.join(sig_details)}")
+                    except (ValueError, TypeError):
+                        pass
+
+                # Check for document-level scripts in /CO (calculation order)
+                if "/CO" in acro_form:
+                    acroform_details.append(
+                        "Calculation Order (/CO) defined: Fields have automatic calculation scripts"
+                    )
+
+                # Process form fields
+                if "/Fields" in acro_form:
+                    fields = acro_form["/Fields"]
+                    if hasattr(fields, "get_object"):
+                        fields = fields.get_object()
+                    if isinstance(fields, ArrayObject):
+                        field_count = len(fields)
+                        acroform_details.append(f"Form contains {field_count} top-level field(s)")
+
+                        for field_ref in fields:
+                            field = field_ref.get_object() if hasattr(field_ref, "get_object") else field_ref
+                            if isinstance(field, DictionaryObject):
+                                _analyze_field(field, "")
+
+    return acroform_details
 
 
 def _extract_additional_actions(
