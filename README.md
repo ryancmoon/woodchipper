@@ -95,6 +95,69 @@ Exit codes:
 - `0` - Success
 - `1` - Validation error (file not found, not readable, or not a PDF)
 
+## HTTP API
+
+Woodchipper includes a FastAPI-based HTTP server for remote PDF analysis.
+
+### Running the Server
+
+```bash
+# Install server dependencies
+pip install fastapi uvicorn python-multipart
+
+# Run the server
+uvicorn woodchipper.server:app --host 0.0.0.0 --port 8080
+
+# Or with auto-reload for development
+uvicorn woodchipper.server:app --host 0.0.0.0 --port 8080 --reload
+```
+
+### Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/health` | Health check |
+| POST | `/analyze` | Upload PDF as multipart form |
+| POST | `/analyze/raw` | Send raw PDF bytes in body |
+| GET | `/docs` | Interactive Swagger UI documentation |
+
+### Usage Examples
+
+```bash
+# Multipart upload
+curl -X POST -F "file=@suspicious.pdf" http://localhost:8080/analyze
+
+# Raw bytes
+curl -X POST -H "Content-Type: application/pdf" \
+  --data-binary @suspicious.pdf \
+  http://localhost:8080/analyze/raw
+
+# Health check
+curl http://localhost:8080/health
+```
+
+### Response
+
+Both `/analyze` and `/analyze/raw` return the same JSON report as the CLI:
+
+```json
+{
+  "filename": "suspicious.pdf",
+  "filesize": 142857,
+  "md5": "...",
+  "sha256": "...",
+  "urls": ["hXXps://example[.]com"],
+  "metadata": { ... },
+  "anomalies": { ... },
+  "forms": { ... }
+}
+```
+
+### Error Handling
+
+- `400 Bad Request` - Invalid file, empty body, or not a PDF
+- `200 OK` - Analysis successful, returns JSON report
+
 ## Library API
 
 ### `process(file_path) -> PdfReport`
