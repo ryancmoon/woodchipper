@@ -2,10 +2,10 @@
 
 All PDF files must be fed to the woodchipper.
 
-__description__ = 'A Python library and CLI tool for analyzing PDF files. Extracts metadata, computes file hashes, finds embedded URLs, detects forms, and identifies suspicious actions and anomalies. All string fields in output are automatically defanged for safe handling.'  
-__author__ = 'Ryan C. Moon'  
-__version__ = '0.0.8'  
-__date__ = '2026-02-04'  
+__description__ = 'A Python library, CLI tool, and HTTP API for analyzing PDF files. Extracts metadata, computes file hashes, finds embedded URLs, detects forms, AcroForms, XFA, JavaScript, embedded files, rich media, and identifies suspicious actions and anomalies. All output is automatically defanged for safe handling.'
+__author__ = 'Ryan C. Moon'
+__version__ = '0.1.0'
+__date__ = '2026-02-05'
 
 To report a bug, please open an issue or submit a PR.
 
@@ -14,6 +14,12 @@ To report a bug, please open an issue or submit a PR.
 
 ```bash
 pip install woodchipper
+```
+
+With HTTP server support:
+
+```bash
+pip install woodchipper[server]
 ```
 
 Or from source:
@@ -60,7 +66,9 @@ Output is JSON with all string fields defanged:
   "anomalies": {
     "anomalies_present": true,
     "anomalies": [
-      "PDF header not at byte 0 (found at byte 18)"
+      "PDF header not at byte 0 (found at byte 18)",
+      "Rich media detected: /3D (3D content). Rich media includes 3D or Flash streams which are no longer supported by modern OS or in common usage. This is suspicious.",
+      "Stream length mismatches detected (1 stream(s)). Mismatched stream lengths may indicate PDF tampering, corruption, or malicious manipulation."
     ],
     "additional_actions_detected": [
       "Document Open: JavaScript execution (code: app.alert('Hello');...)"
@@ -80,6 +88,15 @@ Output is JSON with all string fields defanged:
         "size": 45056,
         "description": "Click to open"
       }
+    ],
+    "acroform_details": [
+      "AcroForm detected in document catalog",
+      "Form contains 3 top-level field(s)",
+      "Field 'username': type=Text, flags=[Required]"
+    ],
+    "xfa_details": [
+      "XFA (XML Forms Architecture) detected",
+      "XFA JavaScript script in template - behaviors: contains URL: var url = 'http://...'..."
     ]
   },
   "forms": {
@@ -102,10 +119,13 @@ Woodchipper includes a FastAPI-based HTTP server for remote PDF analysis.
 ### Running the Server
 
 ```bash
-# Install server dependencies
-pip install fastapi uvicorn python-multipart
+# Install with server dependencies
+pip install woodchipper[server]
 
-# Run the server
+# Run with the built-in command
+woodchipper-server
+
+# Or run directly with uvicorn
 uvicorn woodchipper.server:app --host 0.0.0.0 --port 8080
 
 # Or with auto-reload for development
@@ -175,6 +195,8 @@ print(report["anomalies"]["additional_actions_detected"])
 print(report["anomalies"]["external_actions"])
 print(report["anomalies"]["javascript_detected"])
 print(report["anomalies"]["embedded_files"])
+print(report["anomalies"]["acroform_details"])
+print(report["anomalies"]["xfa_details"])
 ```
 
 **Note:** All string fields in the returned report are defanged for safe handling.
@@ -218,7 +240,7 @@ if metadata["spoofing_indicators"]:
 
 ### `check_anomalies(file_path) -> PdfAnomalies`
 
-Check for PDF structural anomalies.
+Check for PDF structural anomalies and suspicious content.
 
 ```python
 from woodchipper import check_anomalies
@@ -235,6 +257,10 @@ if anomalies["anomalies_present"]:
         print(f"JavaScript: {js}")
     for ef in anomalies["embedded_files"]:
         print(f"Embedded: {ef['name']} ({ef['mime_type']})")
+    for form in anomalies["acroform_details"]:
+        print(f"AcroForm: {form}")
+    for xfa in anomalies["xfa_details"]:
+        print(f"XFA: {xfa}")
 ```
 
 **Detects:**
@@ -243,10 +269,14 @@ if anomalies["anomalies_present"]:
 - Missing or malformed binary marker
 - Missing %%EOF marker
 - Data after %%EOF (appended content)
+- Rich media (3D, Flash) - no longer supported, suspicious
+- Stream length mismatches (tampering indicator)
 - `/OpenAction` and `/AA` (Additional Actions) triggers
 - External actions (`/Launch`, `/URI`, `/GoToR`, `/GoToE`)
 - Embedded JavaScript with behavior analysis
 - Embedded files with file type detection
+- AcroForm details (field types, flags, actions)
+- XFA (XML Forms Architecture) with script extraction
 
 ### `detect_additionalactions(file_path) -> list[str]`
 
@@ -289,14 +319,6 @@ for action in actions:
 - `/GoToR` - Opens remote PDF documents
 - `/GoToE` - Opens embedded documents
 
-**Output format:**
-```
-/Launch at Document OpenAction: Launches external application (file: cmd.exe)
-/URI at Page 1 Annotation 1: Opens URL (https://example.com)
-/GoToR at Page 2 Annotation 3: Opens remote PDF document (file: remote.pdf)
-/GoToE at Document OpenAction: Opens embedded document (file: embedded.pdf)
-```
-
 ### `detect_javascript(file_path) -> list[str]`
 
 Detect JavaScript code embedded in a PDF with behavior analysis.
@@ -327,13 +349,6 @@ for script in scripts:
 - `sets timer/delayed execution` - setInterval/setTimeout
 - `potential heap spray` - Collab.getIcon exploit pattern
 
-**Output format:**
-```
-Document OpenAction: displays alert (code: app.alert('Hello World');)
-Page 1 Annotation 1 Mouse Down: launches URL; evaluates dynamic code (code: var url = eval(x); app.launchURL(url);...)
-Named JavaScript 'init': defines function; contains URL reference (code: function init() { ... }...)
-```
-
 ### `detect_embedded_file(file_path) -> list[EmbeddedFile]`
 
 Detect files embedded or attached to a PDF.
@@ -361,16 +376,96 @@ for f in files:
 - `size` - File size in bytes
 - `description` - Description from PDF metadata
 
-**Output format:**
-```json
-{
-  "name": "document.docx",
-  "file_type": "Microsoft Word 2007+",
-  "mime_type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-  "size": 15234,
-  "description": "Original document"
-}
+### `detect_acroform(file_path) -> list[str]`
+
+Detect and analyze AcroForm structures in a PDF.
+
+```python
+from woodchipper import detect_acroform
+
+details = detect_acroform("document.pdf")
+for detail in details:
+    print(detail)
 ```
+
+**Detects:**
+- Presence of AcroForm in document catalog
+- XFA forms (XML Forms Architecture)
+- NeedAppearances flag (dynamic appearance generation)
+- Signature flags (SignaturesExist, AppendOnly)
+- Calculation Order (/CO) - automatic calculation scripts
+- Form field details:
+  - Field types (Text, Button, Choice, Signature)
+  - Field flags (ReadOnly, Required, Password, Multiline, etc.)
+  - Actions attached to fields
+  - JavaScript in field actions
+
+### `detect_xmlforms(file_path) -> list[str]`
+
+Detect and analyze XFA (XML Forms Architecture) in a PDF.
+
+```python
+from woodchipper import detect_xmlforms
+
+details = detect_xmlforms("document.pdf")
+for detail in details:
+    print(detail)
+```
+
+**Detects:**
+- XFA presence and structure (array or single stream)
+- XFA components (template, config, datasets, localeSet, etc.)
+- Embedded scripts (JavaScript and FormCalc)
+- Event handlers (onClick, onEnter, onChange, etc.)
+- Submit actions and URL targets
+- Dangerous operations:
+  - `xfa.host.messageBox` - message display
+  - `xfa.host.exportData` / `importData` - data operations
+  - `xfa.host.gotoURL` - URL navigation
+  - `app.launchURL`, `app.execMenuItem` - application actions
+  - `ADBC.*` - database connectivity
+  - `Net.HTTP`, `SOAP.*` - network operations
+
+### `detect_richmedia(file_path) -> list[str]`
+
+Detect rich media content (3D, Flash, multimedia) in a PDF.
+
+```python
+from woodchipper import detect_richmedia
+
+findings = detect_richmedia("document.pdf")
+for finding in findings:
+    print(finding)
+```
+
+**Detects:**
+- `/RichMedia` annotations and related tags
+- `/3D`, `/3DD`, `/3DA`, `/3DV`, `/3DI` - 3D content
+- `/U3D` (Universal 3D), `/PRC` (Product Representation Compact)
+- `/Flash`, `/Movie`, `/Sound`, `/Screen` - multimedia
+- `/Rendition`, `/GoTo3DView` - multimedia actions
+
+**Note:** Rich media like 3D and Flash are no longer supported by modern OS and PDF readers, making their presence suspicious.
+
+### `detect_stream_mismatches(file_path) -> list[str]`
+
+Detect mismatches between declared and actual PDF stream lengths.
+
+```python
+from woodchipper import detect_stream_mismatches
+
+mismatches = detect_stream_mismatches("document.pdf")
+for mismatch in mismatches:
+    print(mismatch)
+```
+
+**Detects:**
+- Missing `endstream` markers (malformed structure)
+- Declared length exceeds actual (truncated/tampered data)
+- Actual length exceeds declared (injected data/buffer overflow attempt)
+- Indirect length reference mismatches
+
+**Note:** Mismatched stream lengths may indicate PDF tampering, corruption, or malicious manipulation to hide content or exploit PDF parsers.
 
 ### `extract_forms(file_path) -> PdfForms`
 
@@ -445,7 +540,8 @@ Exception raised when file validation fails:
         "anomalies_present": { "type": "boolean" },
         "anomalies": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": { "type": "string" },
+          "description": "Structural anomalies, rich media findings, and stream length mismatches"
         },
         "additional_actions_detected": {
           "type": "array",
@@ -471,6 +567,16 @@ Exception raised when file validation fails:
               "description": { "type": ["string", "null"] }
             }
           }
+        },
+        "acroform_details": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "AcroForm field details, types, flags, and actions"
+        },
+        "xfa_details": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "XFA (XML Forms Architecture) components and scripts"
         }
       }
     },
@@ -491,7 +597,13 @@ Exception raised when file validation fails:
 
 ## Development
 
-Install in editable mode with dev dependencies:
+Install in editable mode with all dependencies:
+
+```bash
+pip install -e ".[all]"
+```
+
+Or just dev dependencies:
 
 ```bash
 pip install -e ".[dev]"

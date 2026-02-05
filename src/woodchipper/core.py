@@ -413,6 +413,10 @@ def check_anomalies(file_path: str | Path) -> PdfAnomalies:
     richmedia = detect_richmedia(path)
     anomalies.extend(richmedia)
 
+    # Detect stream length mismatches - adds to anomalies list
+    stream_mismatches = detect_stream_mismatches(path)
+    anomalies.extend(stream_mismatches)
+
     # Detect additional actions
     additional_actions = detect_additionalactions(path)
 
@@ -1745,6 +1749,141 @@ def detect_richmedia(file_path: str | Path) -> list[str]:
         )
 
     return richmedia_findings
+
+
+def detect_stream_mismatches(file_path: str | Path) -> list[str]:
+    """Detect mismatches between declared and actual PDF stream lengths.
+
+    PDF streams have a /Length key that declares the expected size. If the
+    actual stream data differs from this declared length, it may indicate
+    the PDF has been tampered with, corrupted, or maliciously crafted.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        List of anomaly descriptions for stream length mismatches found.
+
+    Raises:
+        ValidationError: If the file isn't a valid, readable PDF.
+    """
+    path = validate_pdf(file_path)
+    mismatches: list[str] = []
+
+    # Read raw PDF content to analyze streams
+    with open(path, "rb") as f:
+        pdf_content = f.read()
+
+    # Find all stream objects by looking for "stream" and "endstream" markers
+    # PDF streams are structured as: << /Length N >> stream\n...data...\nendstream
+    stream_pattern = rb"/Length\s+(\d+)(?:\s+\d+\s+R|\s*(?:/[A-Za-z]+\s*[^>]*)*)\s*>>[\r\n\s]*stream[\r\n]"
+
+    mismatched_count = 0
+    total_streams = 0
+
+    for match in re.finditer(stream_pattern, pdf_content):
+        total_streams += 1
+        declared_length = int(match.group(1))
+        stream_start = match.end()
+
+        # Find the endstream marker
+        endstream_pos = pdf_content.find(b"endstream", stream_start)
+        if endstream_pos == -1:
+            mismatches.append(
+                f"Stream at offset {match.start()}: Missing 'endstream' marker. "
+                "This indicates a malformed or corrupted PDF structure."
+            )
+            mismatched_count += 1
+            continue
+
+        # Calculate actual stream length (accounting for possible trailing whitespace)
+        actual_data = pdf_content[stream_start:endstream_pos]
+
+        # PDF spec allows for optional EOL before endstream
+        # Strip trailing \r\n or \n if present
+        if actual_data.endswith(b"\r\n"):
+            actual_length = len(actual_data) - 2
+        elif actual_data.endswith(b"\n") or actual_data.endswith(b"\r"):
+            actual_length = len(actual_data) - 1
+        else:
+            actual_length = len(actual_data)
+
+        # Check for mismatch
+        if declared_length != actual_length:
+            # Allow small tolerance for EOL variations
+            diff = abs(declared_length - actual_length)
+            if diff > 2:  # More than just EOL difference
+                mismatched_count += 1
+                if declared_length > actual_length:
+                    mismatches.append(
+                        f"Stream at offset {match.start()}: Declared length ({declared_length}) "
+                        f"exceeds actual length ({actual_length}) by {diff} bytes. "
+                        "May indicate truncated or tampered stream data."
+                    )
+                else:
+                    mismatches.append(
+                        f"Stream at offset {match.start()}: Actual length ({actual_length}) "
+                        f"exceeds declared length ({declared_length}) by {diff} bytes. "
+                        "May indicate injected data or buffer overflow attempt."
+                    )
+
+    # Also check for streams using indirect /Length references
+    # Pattern: /Length N 0 R (indirect reference)
+    indirect_pattern = rb"/Length\s+(\d+)\s+(\d+)\s+R"
+    indirect_refs = list(re.finditer(indirect_pattern, pdf_content))
+
+    if indirect_refs:
+        # Try to resolve indirect length references and check them
+        for match in indirect_refs:
+            obj_num = int(match.group(1))
+            gen_num = int(match.group(2))
+
+            # Find the object definition: N G obj ... endobj
+            obj_pattern = rf"{obj_num}\\s+{gen_num}\\s+obj\\s*(\\d+)\\s*endobj".encode()
+            obj_match = re.search(obj_pattern, pdf_content)
+
+            if obj_match:
+                try:
+                    declared_length = int(obj_match.group(1))
+                    # Find corresponding stream
+                    stream_start_search = pdf_content.find(b"stream", match.end())
+                    if stream_start_search != -1 and stream_start_search < match.end() + 200:
+                        # Find actual start after "stream\n"
+                        newline_pos = pdf_content.find(b"\n", stream_start_search)
+                        if newline_pos != -1:
+                            actual_start = newline_pos + 1
+                            endstream_pos = pdf_content.find(b"endstream", actual_start)
+                            if endstream_pos != -1:
+                                actual_data = pdf_content[actual_start:endstream_pos]
+                                if actual_data.endswith(b"\r\n"):
+                                    actual_length = len(actual_data) - 2
+                                elif actual_data.endswith(b"\n") or actual_data.endswith(b"\r"):
+                                    actual_length = len(actual_data) - 1
+                                else:
+                                    actual_length = len(actual_data)
+
+                                diff = abs(declared_length - actual_length)
+                                if diff > 2:
+                                    mismatched_count += 1
+                                    mismatches.append(
+                                        f"Stream with indirect length ref ({obj_num} {gen_num} R): "
+                                        f"Declared {declared_length} bytes, actual {actual_length} bytes "
+                                        f"(diff: {diff}). Indirect length references with mismatches "
+                                        "are suspicious."
+                                    )
+                except (ValueError, IndexError):
+                    pass
+
+    # Add summary if mismatches found
+    if mismatched_count > 0:
+        mismatches.insert(
+            0,
+            f"Stream length mismatches detected ({mismatched_count} stream(s)). "
+            "Mismatched stream lengths may indicate PDF tampering, corruption, "
+            "or malicious manipulation to hide content or exploit PDF parsers."
+        )
+
+    return mismatches
 
 
 def _extract_additional_actions(
