@@ -46,6 +46,7 @@ class PdfAnomalies(TypedDict):
     javascript_detected: list[str]
     embedded_files: list[EmbeddedFile]
     acroform_details: list[str]
+    xfa_details: list[str]
 
 
 class PdfForms(TypedDict):
@@ -423,6 +424,9 @@ def check_anomalies(file_path: str | Path) -> PdfAnomalies:
     # Detect AcroForm details
     acroform = detect_acroform(path)
 
+    # Detect XFA (XML Forms Architecture) details
+    xfa = detect_xmlforms(path)
+
     has_anomalies = (
         bool(anomalies)
         or bool(additional_actions)
@@ -430,6 +434,7 @@ def check_anomalies(file_path: str | Path) -> PdfAnomalies:
         or bool(javascript)
         or bool(embedded)
         or bool(acroform)
+        or bool(xfa)
     )
 
     return PdfAnomalies(
@@ -440,6 +445,7 @@ def check_anomalies(file_path: str | Path) -> PdfAnomalies:
         javascript_detected=javascript,
         embedded_files=embedded,
         acroform_details=acroform,
+        xfa_details=xfa,
     )
 
 
@@ -1378,6 +1384,226 @@ def detect_acroform(file_path: str | Path) -> list[str]:
                                 _analyze_field(field, "")
 
     return acroform_details
+
+
+def detect_xmlforms(file_path: str | Path) -> list[str]:
+    """Detect and analyze XFA (XML Forms Architecture) in a PDF.
+
+    XFA forms can contain embedded scripts (JavaScript, FormCalc) and
+    active content that may be used for malicious purposes.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        List of descriptions of XFA features and extracted scripts found.
+
+    Raises:
+        ValidationError: If the file isn't a valid, readable PDF.
+    """
+    path = validate_pdf(file_path)
+    xfa_details: list[str] = []
+
+    try:
+        reader = PdfReader(str(path))
+    except Exception:
+        # PDF is too malformed to parse
+        return []
+
+    def _extract_stream_data(obj) -> str | None:
+        """Extract text data from a stream object."""
+        if hasattr(obj, "get_object"):
+            obj = obj.get_object()
+        if hasattr(obj, "get_data"):
+            try:
+                data = obj.get_data()
+                return data.decode("utf-8", errors="replace")
+            except Exception:
+                return None
+        return str(obj) if obj else None
+
+    def _analyze_xfa_xml(xml_content: str, component_name: str) -> None:
+        """Analyze XFA XML content for scripts and form structure."""
+        # Check for script tags
+        script_patterns = [
+            (r"<script[^>]*>(.*?)</script>", "JavaScript"),
+            (r"<script\s+contentType=['\"]application/x-formcalc['\"][^>]*>(.*?)</script>", "FormCalc"),
+            (r"<script\s+contentType=['\"]application/x-javascript['\"][^>]*>(.*?)</script>", "JavaScript"),
+        ]
+
+        for pattern, script_type in script_patterns:
+            matches = re.findall(pattern, xml_content, re.DOTALL | re.IGNORECASE)
+            for match in matches:
+                script_content = match.strip()
+                if script_content:
+                    # Truncate long scripts for display
+                    preview = script_content[:200].replace("\n", " ").replace("\r", " ")
+                    if len(script_content) > 200:
+                        preview += "..."
+
+                    # Analyze script behavior
+                    behaviors = _analyze_script_behavior(script_content, script_type)
+                    behavior_str = f" - behaviors: {behaviors}" if behaviors else ""
+
+                    xfa_details.append(
+                        f"XFA {script_type} script in {component_name}{behavior_str}: {preview}"
+                    )
+
+        # Check for event handlers
+        event_patterns = [
+            (r'<event\s+activity=["\']([^"\']+)["\'][^>]*>', "event handler"),
+            (r'on(Click|Enter|Exit|Change|Full|Ready|Initialize|Calculate|Validate|IndexChange)\s*=', "inline event"),
+        ]
+
+        for pattern, event_type in event_patterns:
+            matches = re.findall(pattern, xml_content, re.IGNORECASE)
+            if matches:
+                unique_events = set(matches) if isinstance(matches[0], str) else set(m[0] if isinstance(m, tuple) else m for m in matches)
+                xfa_details.append(
+                    f"XFA {event_type}s in {component_name}: {', '.join(sorted(unique_events))}"
+                )
+
+        # Check for submit actions
+        submit_patterns = [
+            r'<submit[^>]*target=["\']([^"\']+)["\']',
+            r'<submit[^>]*url=["\']([^"\']+)["\']',
+            r'xfa\.host\.exportData\([^)]*\)',
+            r'xfa\.host\.gotoURL\([^)]*["\']([^"\']+)["\']',
+        ]
+
+        for pattern in submit_patterns:
+            matches = re.findall(pattern, xml_content, re.IGNORECASE)
+            for match in matches:
+                if match:
+                    xfa_details.append(f"XFA submit/URL action in {component_name}: {match}")
+
+        # Check for potentially dangerous operations
+        dangerous_patterns = [
+            (r"xfa\.host\.messageBox", "displays message box"),
+            (r"xfa\.host\.exportData", "exports form data"),
+            (r"xfa\.host\.importData", "imports data"),
+            (r"xfa\.host\.gotoURL", "navigates to URL"),
+            (r"xfa\.host\.openList", "opens list"),
+            (r"xfa\.host\.print", "triggers print"),
+            (r"xfa\.host\.response", "prompts for user input"),
+            (r"app\.launchURL", "launches URL"),
+            (r"app\.execMenuItem", "executes menu item"),
+            (r"util\.printd", "date formatting (potential exploit)"),
+            (r"Collab\.", "collaboration features"),
+            (r"ADBC\.", "database connectivity"),
+            (r"Net\.HTTP", "network operations"),
+            (r"SOAP\.", "SOAP web services"),
+        ]
+
+        for pattern, description in dangerous_patterns:
+            if re.search(pattern, xml_content, re.IGNORECASE):
+                xfa_details.append(f"XFA {description} detected in {component_name}")
+
+    def _analyze_script_behavior(script: str, script_type: str) -> str:
+        """Analyze script content for suspicious behaviors."""
+        behaviors = []
+        script_lower = script.lower()
+
+        if script_type == "FormCalc":
+            # FormCalc-specific patterns
+            if "url(" in script_lower or "get(" in script_lower or "post(" in script_lower:
+                behaviors.append("network request")
+            if "put(" in script_lower:
+                behaviors.append("file write")
+            if "exists(" in script_lower:
+                behaviors.append("file system access")
+            if "encode(" in script_lower or "decode(" in script_lower:
+                behaviors.append("encoding operations")
+            if "eval(" in script_lower:
+                behaviors.append("dynamic evaluation")
+        else:
+            # JavaScript patterns
+            if "eval(" in script_lower:
+                behaviors.append("eval")
+            if "xmlhttp" in script_lower or "fetch(" in script_lower:
+                behaviors.append("network request")
+            if "unescape(" in script_lower or "fromcharcode" in script_lower:
+                behaviors.append("decoding/obfuscation")
+            if "document.write" in script_lower:
+                behaviors.append("document modification")
+
+        # Common patterns
+        if "http://" in script_lower or "https://" in script_lower:
+            behaviors.append("contains URL")
+        if "base64" in script_lower:
+            behaviors.append("base64 operations")
+        if re.search(r"\\x[0-9a-f]{2}", script_lower):
+            behaviors.append("hex-encoded strings")
+        if len(script) > 1000:
+            behaviors.append("large script block")
+
+        return "; ".join(behaviors) if behaviors else ""
+
+    # Check document catalog for /AcroForm with /XFA
+    if reader.trailer and "/Root" in reader.trailer:
+        root = reader.trailer["/Root"]
+        if hasattr(root, "get_object"):
+            root = root.get_object()
+
+        if isinstance(root, DictionaryObject) and "/AcroForm" in root:
+            acro_form = root["/AcroForm"]
+            if hasattr(acro_form, "get_object"):
+                acro_form = acro_form.get_object()
+
+            if isinstance(acro_form, DictionaryObject) and "/XFA" in acro_form:
+                xfa = acro_form["/XFA"]
+                if hasattr(xfa, "get_object"):
+                    xfa = xfa.get_object()
+
+                xfa_details.append("XFA (XML Forms Architecture) detected")
+
+                # XFA can be a stream or an array of name/stream pairs
+                if isinstance(xfa, ArrayObject):
+                    # Array format: [name1, stream1, name2, stream2, ...]
+                    xfa_details.append(f"XFA structure: array with {len(xfa)} elements")
+
+                    # Known XFA component names
+                    xfa_components = {
+                        "preamble": "XML preamble",
+                        "config": "form configuration",
+                        "template": "form template/layout",
+                        "localeSet": "locale settings",
+                        "datasets": "form data",
+                        "stylesheet": "CSS styling",
+                        "xmpmeta": "XMP metadata",
+                        "xfdf": "forms data format",
+                        "postamble": "XML postamble",
+                    }
+
+                    for i in range(0, len(xfa), 2):
+                        if i + 1 < len(xfa):
+                            component_name = str(xfa[i])
+                            component_stream = xfa[i + 1]
+
+                            # Describe the component
+                            component_desc = xfa_components.get(
+                                component_name, f"unknown component"
+                            )
+                            xfa_details.append(
+                                f"XFA component '{component_name}': {component_desc}"
+                            )
+
+                            # Extract and analyze content
+                            content = _extract_stream_data(component_stream)
+                            if content:
+                                _analyze_xfa_xml(content, component_name)
+
+                else:
+                    # Single stream containing entire XFA
+                    xfa_details.append("XFA structure: single stream")
+                    content = _extract_stream_data(xfa)
+                    if content:
+                        # Try to identify what's in the stream
+                        if "<?xml" in content:
+                            xfa_details.append("XFA contains XML content")
+                        _analyze_xfa_xml(content, "main XFA stream")
+
+    return xfa_details
 
 
 def _extract_additional_actions(
