@@ -409,6 +409,10 @@ def check_anomalies(file_path: str | Path) -> PdfAnomalies:
                     "may indicate appended content"
                 )
 
+    # Detect rich media (3D, Flash, etc.) - adds to anomalies list
+    richmedia = detect_richmedia(path)
+    anomalies.extend(richmedia)
+
     # Detect additional actions
     additional_actions = detect_additionalactions(path)
 
@@ -1604,6 +1608,143 @@ def detect_xmlforms(file_path: str | Path) -> list[str]:
                         _analyze_xfa_xml(content, "main XFA stream")
 
     return xfa_details
+
+
+def detect_richmedia(file_path: str | Path) -> list[str]:
+    """Detect rich media content (/RichMedia, /3D, Flash) in a PDF.
+
+    Rich media such as 3D content and Flash are no longer supported by
+    modern operating systems and PDF readers, making their presence suspicious.
+
+    Args:
+        file_path: Path to the PDF file.
+
+    Returns:
+        List of anomaly descriptions for rich media found.
+
+    Raises:
+        ValidationError: If the file isn't a valid, readable PDF.
+    """
+    path = validate_pdf(file_path)
+    richmedia_findings: list[str] = []
+
+    try:
+        reader = PdfReader(str(path))
+    except Exception:
+        # PDF is too malformed to parse
+        return []
+
+    # Tags to search for
+    richmedia_tags = {
+        "/RichMedia": "RichMedia annotation (embedded multimedia)",
+        "/3D": "3D content",
+        "/3DD": "3D data dictionary",
+        "/3DA": "3D activation dictionary",
+        "/3DV": "3D view dictionary",
+        "/3DI": "3D interactive",
+        "/Flash": "Flash content",
+        "/Movie": "Movie/video content",
+        "/Sound": "Sound content",
+        "/Screen": "Screen annotation (multimedia)",
+        "/RichMediaContent": "RichMedia content stream",
+        "/RichMediaSettings": "RichMedia settings",
+        "/RichMediaActivation": "RichMedia activation",
+        "/RichMediaDeactivation": "RichMedia deactivation",
+        "/RichMediaAnimation": "RichMedia animation",
+        "/RichMediaPresentation": "RichMedia presentation",
+        "/U3D": "Universal 3D format",
+        "/PRC": "Product Representation Compact (3D)",
+    }
+
+    found_tags: set[str] = set()
+
+    def _scan_dict_for_richmedia(obj: DictionaryObject, location: str) -> None:
+        """Recursively scan a dictionary for rich media tags."""
+        for tag, description in richmedia_tags.items():
+            if tag in obj:
+                found_tags.add(tag)
+
+        # Check /Subtype for rich media annotation types
+        subtype = obj.get("/Subtype")
+        if subtype:
+            subtype_str = str(subtype)
+            if subtype_str in ("/RichMedia", "/3D", "/Movie", "/Sound", "/Screen"):
+                found_tags.add(subtype_str)
+
+        # Check /S (action type) for multimedia actions
+        action_type = obj.get("/S")
+        if action_type:
+            action_str = str(action_type)
+            if action_str in ("/Rendition", "/Movie", "/Sound", "/GoTo3DView"):
+                found_tags.add(action_str)
+
+    # Check document catalog
+    if reader.trailer and "/Root" in reader.trailer:
+        root = reader.trailer["/Root"]
+        if hasattr(root, "get_object"):
+            root = root.get_object()
+
+        if isinstance(root, DictionaryObject):
+            _scan_dict_for_richmedia(root, "Document Catalog")
+
+            # Check /Names dictionary for embedded files that might be rich media
+            if "/Names" in root:
+                names = root["/Names"]
+                if hasattr(names, "get_object"):
+                    names = names.get_object()
+                if isinstance(names, DictionaryObject):
+                    _scan_dict_for_richmedia(names, "Names Dictionary")
+
+    # Check each page for rich media annotations
+    for page_num, page in enumerate(reader.pages, start=1):
+        page_dict = page.get_object() if hasattr(page, "get_object") else page
+        if not isinstance(page_dict, DictionaryObject):
+            continue
+
+        _scan_dict_for_richmedia(page_dict, f"Page {page_num}")
+
+        # Check annotations
+        annotations = page_dict.get("/Annots")
+        if annotations is None:
+            continue
+
+        if hasattr(annotations, "get_object"):
+            annotations = annotations.get_object()
+
+        if isinstance(annotations, ArrayObject):
+            annot_list = annotations
+        else:
+            annot_list = [annotations]
+
+        for annot_idx, annot_ref in enumerate(annot_list, start=1):
+            annot = annot_ref.get_object() if hasattr(annot_ref, "get_object") else annot_ref
+            if not isinstance(annot, DictionaryObject):
+                continue
+
+            _scan_dict_for_richmedia(annot, f"Page {page_num} Annotation {annot_idx}")
+
+            # Check action dictionaries within annotations
+            if "/A" in annot:
+                action = annot["/A"]
+                if hasattr(action, "get_object"):
+                    action = action.get_object()
+                if isinstance(action, DictionaryObject):
+                    _scan_dict_for_richmedia(action, f"Page {page_num} Annotation {annot_idx} Action")
+
+    # Build anomaly message if any rich media was found
+    if found_tags:
+        tag_descriptions = []
+        for tag in sorted(found_tags):
+            desc = richmedia_tags.get(tag, tag)
+            tag_descriptions.append(f"{tag} ({desc})")
+
+        richmedia_findings.append(
+            f"Rich media detected: {', '.join(tag_descriptions)}. "
+            "Rich media includes 3D or Flash streams which are no longer supported "
+            "by modern OS or in common usage. This is suspicious."
+        )
+
+    return richmedia_findings
 
 
 def _extract_additional_actions(
