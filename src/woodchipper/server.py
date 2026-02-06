@@ -95,7 +95,7 @@ def main(host: str = "0.0.0.0", port: int = 8080):
     """Run the server."""
     import uvicorn
 
-    uvicorn.run(app, host=host, port=port, limit_max_request_size=1024 * 1024 * 1024)
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
