@@ -12,7 +12,7 @@ from .core import ValidationError, process
 app = FastAPI(
     title="Woodchipper API",
     description="PDF analysis API - extracts metadata, URLs, detects anomalies, JavaScript, embedded files, and more.",
-    version="0.1.0",
+    version="1.0.0",
 )
 
 
@@ -95,7 +95,7 @@ def main(host: str = "0.0.0.0", port: int = 8080):
     """Run the server."""
     import uvicorn
 
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(app, host=host, port=port, limit_max_request_size=1024 * 1024 * 1024)
 
 
 if __name__ == "__main__":
