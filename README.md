@@ -4,8 +4,8 @@ All PDF files must be fed to the woodchipper.
 
 __description__ = 'A Python library, CLI tool, and HTTP API for analyzing PDF files. Extracts metadata, computes file hashes, finds embedded URLs, detects forms, AcroForms, XFA, JavaScript, embedded files, rich media, and identifies suspicious actions and anomalies. All output is automatically defanged for safe handling.'  
 __author__ = 'Ryan C. Moon'  
-__version__ = '0.1.0'  
-__date__ = '2026-02-05'  
+__version__ = '1.0.0'  
+__date__ = '2026-02-06'  
 
 To report a bug, please open an issue or submit a PR.
 
