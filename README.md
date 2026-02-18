@@ -4,8 +4,8 @@ All PDF files must be fed to the woodchipper.
 
 __description__ = 'A Python library, CLI tool, and HTTP API for analyzing PDF files. Extracts metadata, computes file hashes, finds embedded URLs, detects forms, AcroForms, XFA, JavaScript, embedded files, rich media, and identifies suspicious actions and anomalies. All output is automatically defanged for safe handling.'  
 __author__ = 'Ryan C. Moon'  
-__version__ = '1.0.0'  
-__date__ = '2026-02-06'  
+__version__ = '1.1.2'
+__date__ = '2026-02-17'  
 
 To report a bug, please open an issue or submit a PR.
 
@@ -71,14 +71,34 @@ Output is JSON with all string fields defanged:
       "Stream length mismatches detected (1 stream(s)). Mismatched stream lengths may indicate PDF tampering, corruption, or malicious manipulation."
     ],
     "additional_actions_detected": [
-      "Document Open: JavaScript execution (code: app.alert('Hello');...)"
+      {
+        "description": "Document Open: JavaScript execution (code: app.alert('Hello');...)",
+        "offset": 361,
+        "raw_bytes": "35 20 30 20 6f 62 6a 0d 0a 3c 3c 2f 4a 53 ...",
+        "decoded_bytes": null
+      }
     ],
     "external_actions": [
-      "/Launch at Document OpenAction: Launches external application (file: cmd.exe)",
-      "/URI at Page 1 Annotation 1: Opens URL (hXXps://malicious[.]com)"
+      {
+        "description": "/Launch at Document OpenAction: Launches external application (file: cmd.exe)",
+        "offset": 274,
+        "raw_bytes": "34 20 30 20 6f 62 6a 0d 0a 3c 3c 2f 46 ...",
+        "decoded_bytes": null
+      },
+      {
+        "description": "/URI at Page 1 Annotation 1: Opens URL (hXXps://malicious[.]com)",
+        "offset": 37039,
+        "raw_bytes": "31 30 20 30 20 6f 62 6a 0d 0a 3c 3c ...",
+        "decoded_bytes": null
+      }
     ],
     "javascript_detected": [
-      "Document OpenAction: displays alert (code: app.alert('Hello');)"
+      {
+        "description": "Document OpenAction: displays alert (code: app.alert('Hello');)",
+        "offset": 361,
+        "raw_bytes": "35 20 30 20 6f 62 6a 0d 0a 3c 3c 2f 4a 53 ...",
+        "decoded_bytes": null
+      }
     ],
     "embedded_files": [
       {
@@ -86,17 +106,45 @@ Output is JSON with all string fields defanged:
         "file_type": "PE32 executable (GUI) Intel 80386",
         "mime_type": "application/x-dosexec",
         "size": 45056,
-        "description": "Click to open"
+        "description": "Click to open",
+        "offset": 892,
+        "raw_bytes": "37 20 30 20 6f 62 6a 0d 0a 3c 3c 2f 54 79 70 65 ...",
+        "decoded_bytes": "4d 5a 90 00 03 00 00 00 04 00 00 00 ff ff 00 00 ..."
       }
     ],
     "acroform_details": [
-      "AcroForm detected in document catalog",
-      "Form contains 3 top-level field(s)",
-      "Field 'username': type=Text, flags=[Required]"
+      {
+        "description": "AcroForm detected in document catalog",
+        "offset": 512,
+        "raw_bytes": "34 20 30 20 6f 62 6a 0d 0a 3c 3c 2f 46 69 65 6c ...",
+        "decoded_bytes": null
+      },
+      {
+        "description": "Form contains 3 top-level field(s)",
+        "offset": 512,
+        "raw_bytes": "34 20 30 20 6f 62 6a 0d 0a 3c 3c 2f 46 69 65 6c ...",
+        "decoded_bytes": null
+      },
+      {
+        "description": "Field 'username': type=Text, flags=[Required]",
+        "offset": 1024,
+        "raw_bytes": "38 20 30 20 6f 62 6a 0d 0a 3c 3c 2f 46 54 2f 54 ...",
+        "decoded_bytes": null
+      }
     ],
     "xfa_details": [
-      "XFA (XML Forms Architecture) detected",
-      "XFA JavaScript script in template - behaviors: contains URL: var url = 'http://...'..."
+      {
+        "description": "XFA (XML Forms Architecture) detected",
+        "offset": 512,
+        "raw_bytes": "34 20 30 20 6f 62 6a 0d 0a 3c 3c 2f 58 46 41 ...",
+        "decoded_bytes": null
+      },
+      {
+        "description": "XFA JavaScript script in template - behaviors: contains URL: var url = 'http://...'...",
+        "offset": 1280,
+        "raw_bytes": "39 20 30 20 6f 62 6a 0d 0a 3c 3c 2f 4c 65 6e ...",
+        "decoded_bytes": "3c 3f 78 6d 6c 20 76 65 72 73 69 6f 6e 3d 22 31 ..."
+      }
     ]
   },
   "forms": {
@@ -191,9 +239,15 @@ report = process("document.pdf")
 print(report["sha256"])
 print(report["urls"])  # Defanged URLs
 print(report["metadata"]["spoofing_indicators"])
-print(report["anomalies"]["additional_actions_detected"])
-print(report["anomalies"]["external_actions"])
-print(report["anomalies"]["javascript_detected"])
+
+# Action fields return ActionDetail dicts with description, offset, raw_bytes, and decoded_bytes
+for action in report["anomalies"]["additional_actions_detected"]:
+    print(f"{action['description']} @ offset {action['offset']}")
+for action in report["anomalies"]["external_actions"]:
+    print(f"{action['description']} @ offset {action['offset']}")
+for js in report["anomalies"]["javascript_detected"]:
+    print(f"{js['description']} @ offset {js['offset']}")
+
 print(report["anomalies"]["embedded_files"])
 print(report["anomalies"]["acroform_details"])
 print(report["anomalies"]["xfa_details"])
@@ -250,17 +304,17 @@ if anomalies["anomalies_present"]:
     for anomaly in anomalies["anomalies"]:
         print(f"Anomaly: {anomaly}")
     for action in anomalies["additional_actions_detected"]:
-        print(f"Action: {action}")
+        print(f"Action: {action['description']} (offset: {action['offset']})")
     for external in anomalies["external_actions"]:
-        print(f"External: {external}")
+        print(f"External: {external['description']} (offset: {external['offset']})")
     for js in anomalies["javascript_detected"]:
-        print(f"JavaScript: {js}")
+        print(f"JavaScript: {js['description']} (offset: {js['offset']})")
     for ef in anomalies["embedded_files"]:
-        print(f"Embedded: {ef['name']} ({ef['mime_type']})")
+        print(f"Embedded: {ef['name']} ({ef['mime_type']}) (offset: {ef['offset']})")
     for form in anomalies["acroform_details"]:
-        print(f"AcroForm: {form}")
+        print(f"AcroForm: {form['description']} (offset: {form['offset']})")
     for xfa in anomalies["xfa_details"]:
-        print(f"XFA: {xfa}")
+        print(f"XFA: {xfa['description']} (offset: {xfa['offset']})")
 ```
 
 **Detects:**
@@ -278,16 +332,16 @@ if anomalies["anomalies_present"]:
 - AcroForm details (field types, flags, actions)
 - XFA (XML Forms Architecture) with script extraction
 
-### `detect_additionalactions(file_path) -> list[str]`
+### `detect_additionalactions(file_path) -> list[ActionDetail]`
 
-Detect automatic actions triggered by PDF events.
+Detect automatic actions triggered by PDF events. Each result is an `ActionDetail` dict with `description`, `offset` (byte offset of the PDF object, or `null` for inline objects), `raw_bytes` (space-separated hex at that offset, or `null`), and `decoded_bytes` (decompressed stream content as hex, or `null` for non-stream objects).
 
 ```python
 from woodchipper import detect_additionalactions
 
 actions = detect_additionalactions("document.pdf")
 for action in actions:
-    print(action)
+    print(f"{action['description']} @ offset {action['offset']}")
 ```
 
 **Detects actions triggered by:**
@@ -301,16 +355,16 @@ for action in actions:
 - Submit form data
 - And more
 
-### `detect_external_actions(file_path) -> list[str]`
+### `detect_external_actions(file_path) -> list[ActionDetail]`
 
-Detect external action tags that access resources outside the PDF.
+Detect external action tags that access resources outside the PDF. Returns `ActionDetail` dicts with forensic offset, raw bytes, and decoded stream bytes.
 
 ```python
 from woodchipper import detect_external_actions
 
 actions = detect_external_actions("document.pdf")
 for action in actions:
-    print(action)
+    print(f"{action['description']} @ offset {action['offset']}")
 ```
 
 **Detects:**
@@ -319,16 +373,16 @@ for action in actions:
 - `/GoToR` - Opens remote PDF documents
 - `/GoToE` - Opens embedded documents
 
-### `detect_javascript(file_path) -> list[str]`
+### `detect_javascript(file_path) -> list[ActionDetail]`
 
-Detect JavaScript code embedded in a PDF with behavior analysis.
+Detect JavaScript code embedded in a PDF with behavior analysis. Returns `ActionDetail` dicts with forensic offset, raw bytes, and decoded stream bytes.
 
 ```python
 from woodchipper import detect_javascript
 
 scripts = detect_javascript("document.pdf")
 for script in scripts:
-    print(script)
+    print(f"{script['description']} @ offset {script['offset']}")
 ```
 
 **Detects `/JavaScript` and `/JS` tags in:**
@@ -362,6 +416,7 @@ for f in files:
     print(f"Type: {f['file_type']}")
     print(f"MIME: {f['mime_type']}")
     print(f"Size: {f['size']} bytes")
+    print(f"Offset: {f['offset']}")
 ```
 
 **Detects embedded files in:**
@@ -375,17 +430,20 @@ for f in files:
 - `mime_type` - MIME type (from magic bytes)
 - `size` - File size in bytes
 - `description` - Description from PDF metadata
+- `offset` - Byte offset of the FileSpec object in the PDF (or `null`)
+- `raw_bytes` - Space-separated hex bytes at the offset (or `null`)
+- `decoded_bytes` - Decompressed embedded file content as space-separated hex (up to 1024 bytes, or `null`)
 
-### `detect_acroform(file_path) -> list[str]`
+### `detect_acroform(file_path) -> list[ActionDetail]`
 
-Detect and analyze AcroForm structures in a PDF.
+Detect and analyze AcroForm structures in a PDF. Returns `ActionDetail` dicts with forensic offset, raw bytes, and decoded stream bytes.
 
 ```python
 from woodchipper import detect_acroform
 
 details = detect_acroform("document.pdf")
 for detail in details:
-    print(detail)
+    print(f"{detail['description']} (offset: {detail['offset']})")
 ```
 
 **Detects:**
@@ -400,16 +458,16 @@ for detail in details:
   - Actions attached to fields
   - JavaScript in field actions
 
-### `detect_xmlforms(file_path) -> list[str]`
+### `detect_xmlforms(file_path) -> list[ActionDetail]`
 
-Detect and analyze XFA (XML Forms Architecture) in a PDF.
+Detect and analyze XFA (XML Forms Architecture) in a PDF. Returns `ActionDetail` dicts with forensic offset, raw bytes, and decoded stream bytes.
 
 ```python
 from woodchipper import detect_xmlforms
 
 details = detect_xmlforms("document.pdf")
 for detail in details:
-    print(detail)
+    print(f"{detail['description']} (offset: {detail['offset']})")
 ```
 
 **Detects:**
@@ -545,15 +603,15 @@ Exception raised when file validation fails:
         },
         "additional_actions_detected": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": { "$ref": "#/$defs/ActionDetail" }
         },
         "external_actions": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": { "$ref": "#/$defs/ActionDetail" }
         },
         "javascript_detected": {
           "type": "array",
-          "items": { "type": "string" }
+          "items": { "$ref": "#/$defs/ActionDetail" }
         },
         "embedded_files": {
           "type": "array",
@@ -564,18 +622,21 @@ Exception raised when file validation fails:
               "file_type": { "type": ["string", "null"] },
               "mime_type": { "type": ["string", "null"] },
               "size": { "type": ["integer", "null"] },
-              "description": { "type": ["string", "null"] }
+              "description": { "type": ["string", "null"] },
+              "offset": { "type": ["integer", "null"] },
+              "raw_bytes": { "type": ["string", "null"] },
+              "decoded_bytes": { "type": ["string", "null"] }
             }
           }
         },
         "acroform_details": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ActionDetail" },
           "description": "AcroForm field details, types, flags, and actions"
         },
         "xfa_details": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": { "$ref": "#/$defs/ActionDetail" },
           "description": "XFA (XML Forms Architecture) components and scripts"
         }
       }
@@ -591,7 +652,32 @@ Exception raised when file validation fails:
       }
     }
   },
-  "required": ["filename", "filesize", "md5", "sha1", "sha256", "urls", "metadata", "anomalies", "forms"]
+  "required": ["filename", "filesize", "md5", "sha1", "sha256", "urls", "metadata", "anomalies", "forms"],
+  "$defs": {
+    "ActionDetail": {
+      "type": "object",
+      "description": "Forensic detail for a detected PDF action",
+      "properties": {
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of the action and its trigger"
+        },
+        "offset": {
+          "type": ["integer", "null"],
+          "description": "Byte offset of the PDF object in the file, or null for inline objects"
+        },
+        "raw_bytes": {
+          "type": ["string", "null"],
+          "description": "Space-separated hex-encoded raw bytes at the offset (up to 256 bytes), or null"
+        },
+        "decoded_bytes": {
+          "type": ["string", "null"],
+          "description": "Space-separated hex-encoded decompressed stream content (up to 1024 bytes), or null for non-stream objects"
+        }
+      },
+      "required": ["description", "offset", "raw_bytes", "decoded_bytes"]
+    }
+  }
 }
 ```
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "woodchipper"
-version = "0.1.0"
+version = "1.1.2"
 description = "A Python library, CLI tool, and HTTP API for analyzing PDF files. Extracts metadata, computes file hashes, finds embedded URLs, detects forms, AcroForms, XFA, JavaScript, embedded files, rich media, and identifies suspicious actions and anomalies. All output is automatically defanged for safe handling."
 readme = "README.md"
 license = "MIT"

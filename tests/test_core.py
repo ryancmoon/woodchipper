@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from woodchipper.core import validate_pdf, process, get_urls, get_pdf_metadata, check_anomalies, detect_additionalactions, detect_external_actions, detect_javascript, detect_embedded_file, extract_forms, ValidationError
+from woodchipper.core import validate_pdf, process, get_urls, get_pdf_metadata, check_anomalies, detect_additionalactions, detect_external_actions, detect_javascript, detect_embedded_file, detect_acroform, detect_xmlforms, extract_forms, ValidationError, _get_object_offset, _read_raw_bytes_hex, _get_decoded_bytes_hex, _make_action_detail
 
 
 def test_validate_pdf_file_not_found():
@@ -642,8 +642,8 @@ def test_detect_additionalactions_with_openaction():
         result = detect_additionalactions(f.name)
 
         assert len(result) > 0
-        assert any("Document Open" in action for action in result)
-        assert any("JavaScript" in action for action in result)
+        assert any("Document Open" in action["description"] for action in result)
+        assert any("JavaScript" in action["description"] for action in result)
 
 
 def test_detect_additionalactions_with_uri_action():
@@ -673,8 +673,8 @@ def test_detect_additionalactions_with_uri_action():
         result = detect_additionalactions(f.name)
 
         assert len(result) > 0
-        assert any("Document Open" in action for action in result)
-        assert any("URL" in action for action in result)
+        assert any("Document Open" in action["description"] for action in result)
+        assert any("URL" in action["description"] for action in result)
 
 
 def test_detect_additionalactions_invalid_file():
@@ -713,6 +713,13 @@ def test_check_anomalies_includes_additional_actions():
         assert anomalies["anomalies_present"] is True
         assert "additional_actions_detected" in anomalies
         assert len(anomalies["additional_actions_detected"]) > 0
+
+        # Verify ActionDetail structure
+        action = anomalies["additional_actions_detected"][0]
+        assert "description" in action
+        assert "offset" in action
+        assert "raw_bytes" in action
+        assert isinstance(action["description"], str)
 
 
 def test_detect_external_actions_no_actions():
@@ -776,8 +783,8 @@ def test_detect_external_actions_with_uri():
         result = detect_external_actions(f.name)
 
         assert len(result) > 0
-        assert any("/URI" in action for action in result)
-        assert any("https://example.com/test" in action for action in result)
+        assert any("/URI" in action["description"] for action in result)
+        assert any("https://example.com/test" in action["description"] for action in result)
 
 
 def test_detect_external_actions_with_launch():
@@ -807,8 +814,8 @@ def test_detect_external_actions_with_launch():
         result = detect_external_actions(f.name)
 
         assert len(result) > 0
-        assert any("/Launch" in action for action in result)
-        assert any("cmd.exe" in action for action in result)
+        assert any("/Launch" in action["description"] for action in result)
+        assert any("cmd.exe" in action["description"] for action in result)
 
 
 def test_detect_external_actions_with_gotor():
@@ -848,8 +855,8 @@ def test_detect_external_actions_with_gotor():
         result = detect_external_actions(f.name)
 
         assert len(result) > 0
-        assert any("/GoToR" in action for action in result)
-        assert any("remote.pdf" in action for action in result)
+        assert any("/GoToR" in action["description"] for action in result)
+        assert any("remote.pdf" in action["description"] for action in result)
 
 
 def test_detect_external_actions_with_gotoe():
@@ -880,8 +887,8 @@ def test_detect_external_actions_with_gotoe():
         result = detect_external_actions(f.name)
 
         assert len(result) > 0
-        assert any("/GoToE" in action for action in result)
-        assert any("embedded" in action for action in result)
+        assert any("/GoToE" in action["description"] for action in result)
+        assert any("embedded" in action["description"] for action in result)
 
 
 def test_detect_external_actions_invalid_file():
@@ -920,7 +927,7 @@ def test_check_anomalies_includes_external_actions():
         assert anomalies["anomalies_present"] is True
         assert "external_actions" in anomalies
         assert len(anomalies["external_actions"]) > 0
-        assert any("/Launch" in action for action in anomalies["external_actions"])
+        assert any("/Launch" in action["description"] for action in anomalies["external_actions"])
 
 
 def test_detect_javascript_no_js():
@@ -974,8 +981,8 @@ def test_detect_javascript_with_alert():
         result = detect_javascript(f.name)
 
         assert len(result) > 0
-        assert any("displays alert" in js for js in result)
-        assert any("app.alert" in js for js in result)
+        assert any("displays alert" in js["description"] for js in result)
+        assert any("app.alert" in js["description"] for js in result)
 
 
 def test_detect_javascript_with_url_launch():
@@ -1005,7 +1012,7 @@ def test_detect_javascript_with_url_launch():
         result = detect_javascript(f.name)
 
         assert len(result) > 0
-        assert any("launches URL" in js for js in result)
+        assert any("launches URL" in js["description"] for js in result)
 
 
 def test_detect_javascript_with_eval():
@@ -1035,7 +1042,7 @@ def test_detect_javascript_with_eval():
         result = detect_javascript(f.name)
 
         assert len(result) > 0
-        assert any("evaluates dynamic code" in js for js in result)
+        assert any("evaluates dynamic code" in js["description"] for js in result)
 
 
 def test_detect_javascript_with_obfuscation():
@@ -1065,7 +1072,7 @@ def test_detect_javascript_with_obfuscation():
         result = detect_javascript(f.name)
 
         assert len(result) > 0
-        assert any("decodes obfuscated content" in js for js in result)
+        assert any("decodes obfuscated content" in js["description"] for js in result)
 
 
 def test_detect_javascript_invalid_file():
@@ -1104,7 +1111,7 @@ def test_check_anomalies_includes_javascript():
         assert anomalies["anomalies_present"] is True
         assert "javascript_detected" in anomalies
         assert len(anomalies["javascript_detected"]) > 0
-        assert any("alert" in js for js in anomalies["javascript_detected"])
+        assert any("alert" in js["description"] for js in anomalies["javascript_detected"])
 
 
 def test_detect_embedded_file_no_embedded():
@@ -1253,3 +1260,968 @@ def test_check_anomalies_includes_embedded_files():
         assert "embedded_files" in anomalies
         assert len(anomalies["embedded_files"]) > 0
         assert anomalies["embedded_files"][0]["name"] == "malware.exe"
+
+
+# ---------------------------------------------------------------------------
+# ActionDetail / offset / raw_bytes tests
+# ---------------------------------------------------------------------------
+
+
+def test_read_raw_bytes_hex_returns_hex():
+    """Test _read_raw_bytes_hex returns correct hex encoding."""
+    data = b"\x00\x01\x02\xff"
+    assert _read_raw_bytes_hex(data, 0, length=4) == "00 01 02 ff"
+
+
+def test_read_raw_bytes_hex_respects_length():
+    """Test _read_raw_bytes_hex slices to at most *length* bytes."""
+    data = b"A" * 1000
+    result = _read_raw_bytes_hex(data, 0, length=10)
+    # 10 bytes = 20 hex chars + 9 spaces
+    assert len(result) == 29
+
+
+def test_read_raw_bytes_hex_none_on_none_offset():
+    """Test _read_raw_bytes_hex returns None when offset is None."""
+    assert _read_raw_bytes_hex(b"data", None) is None
+
+
+def test_get_object_offset_returns_none_for_plain_object():
+    """Test _get_object_offset returns None when obj has no indirect_reference."""
+    from pypdf import PdfReader
+    from pypdf.generic import DictionaryObject, NameObject
+
+    # A plain DictionaryObject built in-memory has no indirect_reference
+    obj = DictionaryObject({NameObject("/S"): NameObject("/JavaScript")})
+
+    # We still need a reader; use a minimal PDF
+    pdf_content = b"""%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj
+3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj
+xref
+0 4
+0000000000 65535 f
+0000000009 00000 n
+0000000052 00000 n
+0000000101 00000 n
+trailer<</Size 4/Root 1 0 R>>
+startxref
+167
+%%EOF"""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_content)
+        f.flush()
+        reader = PdfReader(f.name)
+        assert _get_object_offset(reader, obj) is None
+
+
+def test_get_object_offset_returns_int_for_indirect_object():
+    """Test _get_object_offset returns an int for an object in the xref table."""
+    from pypdf import PdfWriter, PdfReader
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('test');"),
+    })
+    # Register as indirect object so it gets its own xref entry
+    indirect_ref = writer._add_object(js_action)
+    writer._root_object[NameObject("/OpenAction")] = indirect_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        reader = PdfReader(f.name)
+        root = reader.trailer["/Root"].get_object()
+        open_action = root["/OpenAction"]
+        offset = _get_object_offset(reader, open_action)
+        assert offset is not None
+        assert isinstance(offset, int)
+        assert offset >= 0
+
+
+def test_make_action_detail_with_indirect_object():
+    """Test _make_action_detail populates offset and raw_bytes for indirect objects."""
+    from pypdf import PdfWriter, PdfReader
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('test');"),
+    })
+    indirect_ref = writer._add_object(js_action)
+    writer._root_object[NameObject("/OpenAction")] = indirect_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        reader = PdfReader(f.name)
+        pdf_bytes = Path(f.name).read_bytes()
+        root = reader.trailer["/Root"].get_object()
+        open_action = root["/OpenAction"]
+
+        detail = _make_action_detail("test desc", reader, pdf_bytes, open_action)
+
+        assert detail["description"] == "test desc"
+        assert detail["offset"] is not None
+        assert isinstance(detail["offset"], int)
+        assert detail["raw_bytes"] is not None
+        assert isinstance(detail["raw_bytes"], str)
+        # raw_bytes should be valid hex
+        bytes.fromhex(detail["raw_bytes"])
+
+
+def test_make_action_detail_parent_fallback():
+    """Test _make_action_detail falls back to parent_obj offset for inline actions."""
+    from pypdf import PdfWriter, PdfReader
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        NumberObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+
+    # Create annotation with an inline /A action dict (no indirect reference).
+    # The annotation itself is registered as an indirect object.
+    link = DictionaryObject({
+        NameObject("/Type"): NameObject("/Annot"),
+        NameObject("/Subtype"): NameObject("/Link"),
+        NameObject("/Rect"): ArrayObject([
+            NumberObject(0), NumberObject(0),
+            NumberObject(100), NumberObject(100),
+        ]),
+        NameObject("/A"): DictionaryObject({
+            NameObject("/Type"): NameObject("/Action"),
+            NameObject("/S"): NameObject("/URI"),
+            NameObject("/URI"): TextStringObject("https://example.com"),
+        }),
+    })
+    annot_ref = writer._add_object(link)
+    page[NameObject("/Annots")] = ArrayObject([annot_ref])
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        reader = PdfReader(f.name)
+        pdf_bytes = Path(f.name).read_bytes()
+
+        page0 = reader.pages[0]
+        annot = page0["/Annots"][0].get_object()
+        action = annot["/A"]
+
+        # The inline action itself should have no offset
+        assert _get_object_offset(reader, action) is None
+
+        # But the parent annotation should
+        parent_offset = _get_object_offset(reader, annot)
+        assert parent_offset is not None
+
+        # _make_action_detail with parent should inherit the annotation offset
+        detail = _make_action_detail("test", reader, pdf_bytes, action, parent_obj=annot)
+        assert detail["offset"] == parent_offset
+        assert detail["raw_bytes"] is not None
+
+
+def test_detect_additionalactions_actiondetail_structure():
+    """Test detect_additionalactions returns ActionDetail dicts with offset and raw_bytes."""
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('test');"),
+    })
+    indirect_ref = writer._add_object(js_action)
+    writer._root_object[NameObject("/OpenAction")] = indirect_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_additionalactions(f.name)
+
+        assert len(result) >= 1
+        for action in result:
+            assert set(action.keys()) == {"description", "offset", "raw_bytes", "decoded_bytes"}
+            assert isinstance(action["description"], str)
+            assert action["offset"] is not None
+            assert isinstance(action["offset"], int)
+            assert action["raw_bytes"] is not None
+            bytes.fromhex(action["raw_bytes"])
+
+
+def test_detect_external_actions_actiondetail_with_offset():
+    """Test detect_external_actions returns ActionDetail with offset for annotation actions."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        NumberObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+
+    link = DictionaryObject({
+        NameObject("/Type"): NameObject("/Annot"),
+        NameObject("/Subtype"): NameObject("/Link"),
+        NameObject("/Rect"): ArrayObject([
+            NumberObject(0), NumberObject(0),
+            NumberObject(100), NumberObject(100),
+        ]),
+        NameObject("/A"): DictionaryObject({
+            NameObject("/Type"): NameObject("/Action"),
+            NameObject("/S"): NameObject("/URI"),
+            NameObject("/URI"): TextStringObject("https://example.com"),
+        }),
+    })
+    # Annotation as indirect object; action is inline within it
+    annot_ref = writer._add_object(link)
+    page[NameObject("/Annots")] = ArrayObject([annot_ref])
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_external_actions(f.name)
+
+        assert len(result) >= 1
+        for action in result:
+            assert set(action.keys()) == {"description", "offset", "raw_bytes", "decoded_bytes"}
+            assert isinstance(action["description"], str)
+            # Annotation parent fallback should provide an offset
+            assert action["offset"] is not None
+            assert isinstance(action["offset"], int)
+            assert action["raw_bytes"] is not None
+            bytes.fromhex(action["raw_bytes"])
+
+
+def test_detect_javascript_actiondetail_with_offset():
+    """Test detect_javascript returns ActionDetail with offset and raw_bytes."""
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('test');"),
+    })
+    indirect_ref = writer._add_object(js_action)
+    writer._root_object[NameObject("/OpenAction")] = indirect_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_javascript(f.name)
+
+        assert len(result) >= 1
+        for action in result:
+            assert set(action.keys()) == {"description", "offset", "raw_bytes", "decoded_bytes"}
+            assert isinstance(action["description"], str)
+            assert action["offset"] is not None
+            assert isinstance(action["offset"], int)
+            assert action["raw_bytes"] is not None
+            bytes.fromhex(action["raw_bytes"])
+
+
+def test_detect_external_actions_launch_actiondetail_with_offset():
+    """Test detect_external_actions returns ActionDetail with offset for /Launch via OpenAction."""
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    launch_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/Launch"),
+        NameObject("/F"): TextStringObject("cmd.exe"),
+    })
+    indirect_ref = writer._add_object(launch_action)
+    writer._root_object[NameObject("/OpenAction")] = indirect_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_external_actions(f.name)
+
+        assert len(result) >= 1
+        action = result[0]
+        assert "/Launch" in action["description"]
+        assert action["offset"] is not None
+        assert isinstance(action["offset"], int)
+        assert action["raw_bytes"] is not None
+
+
+def test_raw_bytes_contain_object_data():
+    """Test that raw_bytes at the offset actually contain PDF object data."""
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('forensic');"),
+    })
+    indirect_ref = writer._add_object(js_action)
+    writer._root_object[NameObject("/OpenAction")] = indirect_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_additionalactions(f.name)
+
+        assert len(result) >= 1
+        action = result[0]
+        raw = bytes.fromhex(action["raw_bytes"])
+        # The raw bytes at the offset should contain a PDF object marker
+        # (e.g., "N 0 obj" pattern) since we point to the start of the object
+        assert b"obj" in raw
+
+
+def test_process_actiondetail_fields_survive_defang():
+    """Test that process() preserves ActionDetail structure through defanging."""
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('test');"),
+    })
+    indirect_ref = writer._add_object(js_action)
+    writer._root_object[NameObject("/OpenAction")] = indirect_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        report = process(f.name)
+
+        for field in ["additional_actions_detected", "javascript_detected"]:
+            items = report["anomalies"][field]
+            assert len(items) >= 1
+            for item in items:
+                assert set(item.keys()) == {"description", "offset", "raw_bytes", "decoded_bytes"}
+                assert isinstance(item["description"], str)
+                # offset is int (not defanged to string) and raw_bytes is hex str
+                assert isinstance(item["offset"], int)
+                assert isinstance(item["raw_bytes"], str)
+                bytes.fromhex(item["raw_bytes"])
+
+
+# ---------------------------------------------------------------------------
+# EmbeddedFile offset / raw_bytes tests
+# ---------------------------------------------------------------------------
+
+
+def test_detect_embedded_file_has_offset_and_raw_bytes():
+    """Test that detect_embedded_file returns offset and raw_bytes fields."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+        NumberObject,
+        DecodedStreamObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    file_content = b"Embedded test content."
+    ef_stream = DecodedStreamObject()
+    ef_stream.set_data(file_content)
+    ef_stream[NameObject("/Type")] = NameObject("/EmbeddedFile")
+    ef_stream[NameObject("/Params")] = DictionaryObject({
+        NameObject("/Size"): NumberObject(len(file_content)),
+    })
+
+    filespec = DictionaryObject({
+        NameObject("/Type"): NameObject("/Filespec"),
+        NameObject("/F"): TextStringObject("payload.bin"),
+        NameObject("/EF"): DictionaryObject({
+            NameObject("/F"): ef_stream,
+        }),
+    })
+    filespec_ref = writer._add_object(filespec)
+
+    names_dict = DictionaryObject({
+        NameObject("/EmbeddedFiles"): DictionaryObject({
+            NameObject("/Names"): ArrayObject([
+                TextStringObject("payload.bin"),
+                filespec_ref,
+            ]),
+        }),
+    })
+    writer._root_object[NameObject("/Names")] = names_dict
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_embedded_file(f.name)
+
+        assert len(result) > 0
+        ef = result[0]
+        assert "offset" in ef
+        assert "raw_bytes" in ef
+        assert ef["name"] == "payload.bin"
+        assert ef["offset"] is not None
+        assert isinstance(ef["offset"], int)
+        assert ef["raw_bytes"] is not None
+        bytes.fromhex(ef["raw_bytes"])
+
+
+def test_check_anomalies_embedded_files_have_offset():
+    """Test that embedded_files through check_anomalies include offset/raw_bytes."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+        DecodedStreamObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    ef_stream = DecodedStreamObject()
+    ef_stream.set_data(b"MZ\x90\x00")
+    ef_stream[NameObject("/Type")] = NameObject("/EmbeddedFile")
+
+    filespec = DictionaryObject({
+        NameObject("/Type"): NameObject("/Filespec"),
+        NameObject("/F"): TextStringObject("malware.exe"),
+        NameObject("/EF"): DictionaryObject({
+            NameObject("/F"): ef_stream,
+        }),
+    })
+    filespec_ref = writer._add_object(filespec)
+
+    names_dict = DictionaryObject({
+        NameObject("/EmbeddedFiles"): DictionaryObject({
+            NameObject("/Names"): ArrayObject([
+                TextStringObject("malware.exe"),
+                filespec_ref,
+            ]),
+        }),
+    })
+    writer._root_object[NameObject("/Names")] = names_dict
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        anomalies = check_anomalies(f.name)
+
+        ef = anomalies["embedded_files"][0]
+        assert ef["name"] == "malware.exe"
+        assert "offset" in ef
+        assert "raw_bytes" in ef
+
+
+# ---------------------------------------------------------------------------
+# detect_acroform ActionDetail tests
+# ---------------------------------------------------------------------------
+
+
+def test_detect_acroform_returns_actiondetail():
+    """Test that detect_acroform returns ActionDetail dicts."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+        NumberObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    # Create a text field
+    field = DictionaryObject({
+        NameObject("/FT"): NameObject("/Tx"),
+        NameObject("/T"): TextStringObject("username"),
+        NameObject("/Ff"): NumberObject(0),
+    })
+    field_ref = writer._add_object(field)
+
+    acro_form = DictionaryObject({
+        NameObject("/Fields"): ArrayObject([field_ref]),
+    })
+    acro_form_ref = writer._add_object(acro_form)
+    writer._root_object[NameObject("/AcroForm")] = acro_form_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_acroform(f.name)
+
+        assert len(result) >= 1
+        # First entry should be "AcroForm detected in document catalog"
+        assert "AcroForm detected" in result[0]["description"]
+        for item in result:
+            assert set(item.keys()) == {"description", "offset", "raw_bytes", "decoded_bytes"}
+            assert isinstance(item["description"], str)
+
+
+def test_detect_acroform_field_has_offset():
+    """Test that acroform field details include offset when field is indirect."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+        NumberObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    field = DictionaryObject({
+        NameObject("/FT"): NameObject("/Tx"),
+        NameObject("/T"): TextStringObject("email"),
+        NameObject("/Ff"): NumberObject(0),
+    })
+    field_ref = writer._add_object(field)
+
+    acro_form = DictionaryObject({
+        NameObject("/Fields"): ArrayObject([field_ref]),
+    })
+    acro_form_ref = writer._add_object(acro_form)
+    writer._root_object[NameObject("/AcroForm")] = acro_form_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_acroform(f.name)
+
+        # Find the field entry
+        field_items = [r for r in result if "Field" in r["description"]]
+        assert len(field_items) >= 1
+        fi = field_items[0]
+        assert fi["offset"] is not None
+        assert isinstance(fi["offset"], int)
+        assert fi["raw_bytes"] is not None
+        raw = bytes.fromhex(fi["raw_bytes"])
+        assert b"obj" in raw
+
+
+def test_check_anomalies_acroform_details_actiondetail():
+    """Test that check_anomalies acroform_details are ActionDetail dicts."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+        NumberObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    field = DictionaryObject({
+        NameObject("/FT"): NameObject("/Tx"),
+        NameObject("/T"): TextStringObject("name"),
+        NameObject("/Ff"): NumberObject(0),
+    })
+    field_ref = writer._add_object(field)
+
+    acro_form = DictionaryObject({
+        NameObject("/Fields"): ArrayObject([field_ref]),
+    })
+    acro_form_ref = writer._add_object(acro_form)
+    writer._root_object[NameObject("/AcroForm")] = acro_form_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        anomalies = check_anomalies(f.name)
+
+        assert anomalies["anomalies_present"] is True
+        for item in anomalies["acroform_details"]:
+            assert "description" in item
+            assert "offset" in item
+            assert "raw_bytes" in item
+
+
+# ---------------------------------------------------------------------------
+# detect_xmlforms ActionDetail tests
+# ---------------------------------------------------------------------------
+
+
+def test_detect_xmlforms_returns_actiondetail():
+    """Test that detect_xmlforms returns ActionDetail dicts."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        DecodedStreamObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    # Create a single-stream XFA with a script
+    xfa_content = b"""<?xml version="1.0"?>
+<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/">
+<script contentType="application/x-javascript">app.alert("xfa test");</script>
+</xdp:xdp>"""
+    xfa_stream = DecodedStreamObject()
+    xfa_stream.set_data(xfa_content)
+    xfa_stream_ref = writer._add_object(xfa_stream)
+
+    acro_form = DictionaryObject({
+        NameObject("/XFA"): xfa_stream_ref,
+    })
+    acro_form_ref = writer._add_object(acro_form)
+    writer._root_object[NameObject("/AcroForm")] = acro_form_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_xmlforms(f.name)
+
+        assert len(result) >= 1
+        # First item should be "XFA (XML Forms Architecture) detected"
+        assert "XFA" in result[0]["description"]
+        for item in result:
+            assert set(item.keys()) == {"description", "offset", "raw_bytes", "decoded_bytes"}
+            assert isinstance(item["description"], str)
+
+
+def test_detect_xmlforms_has_offset():
+    """Test that detect_xmlforms returns offsets for XFA entries."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        DecodedStreamObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    xfa_content = b"""<?xml version="1.0"?>
+<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/">
+<script>xfa.host.messageBox("test");</script>
+</xdp:xdp>"""
+    xfa_stream = DecodedStreamObject()
+    xfa_stream.set_data(xfa_content)
+    xfa_stream_ref = writer._add_object(xfa_stream)
+
+    acro_form = DictionaryObject({
+        NameObject("/XFA"): xfa_stream_ref,
+    })
+    acro_form_ref = writer._add_object(acro_form)
+    writer._root_object[NameObject("/AcroForm")] = acro_form_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_xmlforms(f.name)
+
+        # At least one item should have a non-null offset
+        offsets = [item["offset"] for item in result if item["offset"] is not None]
+        assert len(offsets) >= 1
+
+
+def test_check_anomalies_xfa_details_actiondetail():
+    """Test that check_anomalies xfa_details are ActionDetail dicts."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        DecodedStreamObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    xfa_content = b"""<?xml version="1.0"?>
+<xdp:xdp xmlns:xdp="http://ns.adobe.com/xdp/">
+<script>app.alert("hello");</script>
+</xdp:xdp>"""
+    xfa_stream = DecodedStreamObject()
+    xfa_stream.set_data(xfa_content)
+    xfa_stream_ref = writer._add_object(xfa_stream)
+
+    acro_form = DictionaryObject({
+        NameObject("/XFA"): xfa_stream_ref,
+    })
+    acro_form_ref = writer._add_object(acro_form)
+    writer._root_object[NameObject("/AcroForm")] = acro_form_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        anomalies = check_anomalies(f.name)
+
+        assert anomalies["anomalies_present"] is True
+        for item in anomalies["xfa_details"]:
+            assert "description" in item
+            assert "offset" in item
+            assert "raw_bytes" in item
+            assert "decoded_bytes" in item
+
+
+# ---------------------------------------------------------------------------
+# decoded_bytes tests
+# ---------------------------------------------------------------------------
+
+
+def test_get_decoded_bytes_hex_returns_none_for_dict():
+    """Test _get_decoded_bytes_hex returns None for plain dict objects (no stream)."""
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    d = DictionaryObject({
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert(1);"),
+    })
+    assert _get_decoded_bytes_hex(d) is None
+
+
+def test_get_decoded_bytes_hex_returns_content_for_stream():
+    """Test _get_decoded_bytes_hex returns decompressed hex for stream objects."""
+    from pypdf.generic import DecodedStreamObject
+
+    stream = DecodedStreamObject()
+    stream.set_data(b"Hello stream content")
+    result = _get_decoded_bytes_hex(stream)
+    assert result is not None
+    assert bytes.fromhex(result) == b"Hello stream content"
+
+
+def test_get_decoded_bytes_hex_respects_length():
+    """Test _get_decoded_bytes_hex truncates to length."""
+    from pypdf.generic import DecodedStreamObject
+
+    stream = DecodedStreamObject()
+    stream.set_data(b"A" * 2000)
+    result = _get_decoded_bytes_hex(stream, length=10)
+    assert result is not None
+    assert bytes.fromhex(result) == b"A" * 10
+
+
+def test_embedded_file_decoded_bytes_contains_file_content():
+    """Test that EmbeddedFile decoded_bytes contains the decompressed file content."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+        NumberObject,
+        DecodedStreamObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    file_content = b"MZ\x90\x00\x03\x00\x00\x00"  # PE header bytes
+    ef_stream = DecodedStreamObject()
+    ef_stream.set_data(file_content)
+    ef_stream[NameObject("/Type")] = NameObject("/EmbeddedFile")
+
+    filespec = DictionaryObject({
+        NameObject("/Type"): NameObject("/Filespec"),
+        NameObject("/F"): TextStringObject("malware.exe"),
+        NameObject("/EF"): DictionaryObject({NameObject("/F"): ef_stream}),
+    })
+    fs_ref = writer._add_object(filespec)
+    names = DictionaryObject({
+        NameObject("/EmbeddedFiles"): DictionaryObject({
+            NameObject("/Names"): ArrayObject([TextStringObject("malware.exe"), fs_ref]),
+        }),
+    })
+    writer._root_object[NameObject("/Names")] = names
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_embedded_file(f.name)
+
+        assert len(result) > 0
+        ef = result[0]
+        assert ef["decoded_bytes"] is not None
+        decoded = bytes.fromhex(ef["decoded_bytes"])
+        assert decoded == file_content
+
+
+def test_xfa_decoded_bytes_contains_xml():
+    """Test that XFA ActionDetail decoded_bytes contains decompressed XML."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        DecodedStreamObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    xfa_content = b'<?xml version="1.0"?><xdp><script>app.alert("xfa");</script></xdp>'
+    xfa_stream = DecodedStreamObject()
+    xfa_stream.set_data(xfa_content)
+    xfa_ref = writer._add_object(xfa_stream)
+
+    acro = DictionaryObject({NameObject("/XFA"): xfa_ref})
+    acro_ref = writer._add_object(acro)
+    writer._root_object[NameObject("/AcroForm")] = acro_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_xmlforms(f.name)
+
+        # Find an item with decoded_bytes (stream-backed entries)
+        decoded_items = [r for r in result if r["decoded_bytes"] is not None]
+        assert len(decoded_items) >= 1
+        decoded = bytes.fromhex(decoded_items[0]["decoded_bytes"])
+        assert b"app.alert" in decoded
+
+
+def test_acroform_decoded_bytes_is_none():
+    """Test that AcroForm ActionDetail decoded_bytes is None for dict objects."""
+    from pypdf import PdfWriter
+    from pypdf.generic import (
+        ArrayObject,
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+    )
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+
+    field = DictionaryObject({
+        NameObject("/FT"): NameObject("/Tx"),
+        NameObject("/T"): TextStringObject("name"),
+    })
+    field_ref = writer._add_object(field)
+    acro = DictionaryObject({NameObject("/Fields"): ArrayObject([field_ref])})
+    acro_ref = writer._add_object(acro)
+    writer._root_object[NameObject("/AcroForm")] = acro_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_acroform(f.name)
+
+        # All items should have decoded_bytes=None since AcroForm uses dicts, not streams
+        for item in result:
+            assert item["decoded_bytes"] is None
+
+
+def test_javascript_action_decoded_bytes_is_none():
+    """Test that JS action ActionDetail decoded_bytes is None for dict-based actions."""
+    from pypdf import PdfWriter
+    from pypdf.generic import DictionaryObject, NameObject, TextStringObject
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('test');"),
+    })
+    indirect_ref = writer._add_object(js_action)
+    writer._root_object[NameObject("/OpenAction")] = indirect_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        result = detect_additionalactions(f.name)
+
+        assert len(result) >= 1
+        # Dict-based JS actions have no stream to decode
+        for item in result:
+            assert item["decoded_bytes"] is None
+
+
+def test_decoded_bytes_for_object_in_objstm():
+    """Test that decoded_bytes returns decompressed ObjStm content for objects stored in object streams."""
+    from pypdf import PdfWriter, PdfReader
+    from pypdf.generic import (
+        DictionaryObject,
+        NameObject,
+        TextStringObject,
+    )
+
+    # Create a normal PDF with an indirect JS action
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    js_action = DictionaryObject({
+        NameObject("/Type"): NameObject("/Action"),
+        NameObject("/S"): NameObject("/JavaScript"),
+        NameObject("/JS"): TextStringObject("app.alert('objstm');"),
+    })
+    js_ref = writer._add_object(js_action)
+    writer._root_object[NameObject("/OpenAction")] = js_ref
+
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        writer.write(f)
+        f.flush()
+        reader = PdfReader(f.name)
+        pdf_bytes = Path(f.name).read_bytes()
+
+        # Resolve the OpenAction to get the action object
+        root = reader.trailer["/Root"].get_object()
+        action_obj = root["/OpenAction"]
+        if hasattr(action_obj, "get_object"):
+            action_obj = action_obj.get_object()
+
+        ref = action_obj.indirect_reference
+        assert ref is not None
+
+        # In a normal PDF, the object is NOT in xref_objStm, so decoded_bytes is None
+        assert ref.idnum not in reader.xref_objStm
+        result = _get_decoded_bytes_hex(action_obj, reader=reader)
+        assert result is None  # dict object, not in ObjStm
+
+        # Now simulate ObjStm storage: move the xref entry to xref_objStm
+        # pointing to an existing stream object (the page content stream)
+        # Find a stream object to use as the fake ObjStm container
+        page = reader.pages[0].get_object()
+        contents = page.get("/Contents")
+        if hasattr(contents, "get_object"):
+            contents = contents.get_object()
+
+        if hasattr(contents, "get_data"):
+            contents_ref = contents.indirect_reference
+            if contents_ref is not None:
+                # Move the action into xref_objStm pointing to the content stream
+                gen = ref.generation
+                # Remove from traditional xref
+                if gen in reader.xref and ref.idnum in reader.xref[gen]:
+                    del reader.xref[gen][ref.idnum]
+                # Add to xref_objStm: maps idnum -> (stream_obj_number, index)
+                reader.xref_objStm[ref.idnum] = (contents_ref.idnum, 0)
+
+                # Now _get_decoded_bytes_hex should decode the content stream
+                result = _get_decoded_bytes_hex(action_obj, reader=reader)
+                assert result is not None
+                decoded = bytes.fromhex(result)
+                assert len(decoded) > 0

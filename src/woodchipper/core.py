@@ -1,6 +1,7 @@
 """Core library functionality."""
 
 import hashlib
+import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -10,7 +11,25 @@ from typing import TypedDict
 import defang
 import magic
 from pypdf import PdfReader
-from pypdf.generic import ArrayObject, DictionaryObject
+from pypdf.generic import ArrayObject, DictionaryObject, IndirectObject
+
+logger = logging.getLogger("woodchipper")
+
+# Prevent pypdf's internal warnings from leaking to stderr.
+# pypdf uses logging.getLogger("pypdf.*").warning() for non-compliant PDFs;
+# without a handler, Python's lastResort handler prints them to stderr.
+logging.getLogger("pypdf").addHandler(logging.NullHandler())
+
+
+class _PypdfWarningCollector(logging.Handler):
+    """Collects pypdf log messages into a list for inclusion in reports."""
+
+    def __init__(self, sink: list[str]) -> None:
+        super().__init__(level=logging.WARNING)
+        self._sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._sink.append(record.getMessage())
 
 
 class PdfMetadata(TypedDict):
@@ -34,6 +53,18 @@ class EmbeddedFile(TypedDict):
     mime_type: str | None
     size: int | None
     description: str | None
+    offset: int | None
+    raw_bytes: str | None  # hex-encoded, up to 256 bytes from file offset
+    decoded_bytes: str | None  # hex-encoded, decompressed stream content (up to 1024 bytes)
+
+
+class ActionDetail(TypedDict):
+    """Forensic detail for a detected PDF action."""
+
+    description: str
+    offset: int | None
+    raw_bytes: str | None  # hex-encoded, up to 256 bytes from file offset
+    decoded_bytes: str | None  # hex-encoded, decompressed stream content (up to 1024 bytes)
 
 
 class PdfAnomalies(TypedDict):
@@ -41,12 +72,12 @@ class PdfAnomalies(TypedDict):
 
     anomalies_present: bool
     anomalies: list[str]
-    additional_actions_detected: list[str]
-    external_actions: list[str]
-    javascript_detected: list[str]
+    additional_actions_detected: list[ActionDetail]
+    external_actions: list[ActionDetail]
+    javascript_detected: list[ActionDetail]
     embedded_files: list[EmbeddedFile]
-    acroform_details: list[str]
-    xfa_details: list[str]
+    acroform_details: list[ActionDetail]
+    xfa_details: list[ActionDetail]
 
 
 class PdfForms(TypedDict):
@@ -104,6 +135,7 @@ def validate_pdf(file_path: str | Path) -> Path:
             "Woodchipper only accepts PDF files."
         )
 
+    logger.info("Validated PDF: %s (%d bytes)", path.name, path.stat().st_size)
     return path
 
 
@@ -125,7 +157,11 @@ def get_urls(file_path: str | Path) -> list[str]:
     path = validate_pdf(file_path)
     urls: set[str] = set()
 
-    reader = PdfReader(str(path))
+    try:
+        reader = PdfReader(str(path))
+    except Exception as e:
+        logger.warning("Failed to parse PDF for URL extraction: %s", e)
+        return []
 
     for page in reader.pages:
         annotations = page.get("/Annots")
@@ -215,7 +251,20 @@ def get_pdf_metadata(file_path: str | Path) -> PdfMetadata:
         ValidationError: If the file isn't a valid, readable PDF.
     """
     path = validate_pdf(file_path)
-    reader = PdfReader(str(path))
+    try:
+        reader = PdfReader(str(path))
+    except Exception as e:
+        logger.warning("Failed to parse PDF for metadata extraction: %s", e)
+        return PdfMetadata(
+            author=None,
+            creator=None,
+            producer=None,
+            subject=None,
+            title=None,
+            creation_date=None,
+            modification_date=None,
+            spoofing_indicators=["PDF could not be parsed for metadata"],
+        )
     meta = reader.metadata
 
     spoofing_indicators: list[str] = []
@@ -457,7 +506,7 @@ def check_anomalies(file_path: str | Path) -> PdfAnomalies:
     )
 
 
-def detect_additionalactions(file_path: str | Path) -> list[str]:
+def detect_additionalactions(file_path: str | Path) -> list[ActionDetail]:
     """Detect /AA (Additional Actions) and /OpenAction tags in a PDF.
 
     Identifies automatic actions triggered on document open, close, or page view.
@@ -466,19 +515,21 @@ def detect_additionalactions(file_path: str | Path) -> list[str]:
         file_path: Path to the PDF file.
 
     Returns:
-        List of detected actions and their triggers.
+        List of ActionDetail dicts describing detected actions.
 
     Raises:
         ValidationError: If the file isn't a valid, readable PDF.
     """
     path = validate_pdf(file_path)
-    actions_found: list[str] = []
+    actions_found: list[ActionDetail] = []
 
     try:
         reader = PdfReader(str(path))
-    except Exception:
-        # PDF is too malformed to parse for actions
+    except Exception as e:
+        logger.debug("Failed to parse PDF for action detection: %s", e)
         return []
+
+    pdf_bytes = path.read_bytes()
 
     # Check document catalog for /OpenAction
     if reader.trailer and "/Root" in reader.trailer:
@@ -494,7 +545,9 @@ def detect_additionalactions(file_path: str | Path) -> list[str]:
                     open_action = open_action.get_object()
                 action_desc = _describe_action(open_action, "Document Open")
                 if action_desc:
-                    actions_found.append(action_desc)
+                    actions_found.append(
+                        _make_action_detail(action_desc, reader, pdf_bytes, open_action)
+                    )
 
             # Check /AA (Additional Actions) at document level
             if "/AA" in root:
@@ -502,7 +555,7 @@ def detect_additionalactions(file_path: str | Path) -> list[str]:
                 if hasattr(aa, "get_object"):
                     aa = aa.get_object()
                 if isinstance(aa, DictionaryObject):
-                    _extract_additional_actions(aa, "Document", actions_found)
+                    _extract_additional_actions(aa, "Document", actions_found, reader, pdf_bytes)
 
     # Check each page for /AA (Additional Actions)
     for i, page in enumerate(reader.pages, start=1):
@@ -512,12 +565,12 @@ def detect_additionalactions(file_path: str | Path) -> list[str]:
             if hasattr(aa, "get_object"):
                 aa = aa.get_object()
             if isinstance(aa, DictionaryObject):
-                _extract_additional_actions(aa, f"Page {i}", actions_found)
+                _extract_additional_actions(aa, f"Page {i}", actions_found, reader, pdf_bytes)
 
     return actions_found
 
 
-def detect_external_actions(file_path: str | Path) -> list[str]:
+def detect_external_actions(file_path: str | Path) -> list[ActionDetail]:
     """Detect external action tags (/Launch, /URI, /GoToR, /GoToE) in a PDF.
 
     These actions can cause the PDF reader to access external resources,
@@ -527,21 +580,23 @@ def detect_external_actions(file_path: str | Path) -> list[str]:
         file_path: Path to the PDF file.
 
     Returns:
-        List of detected external actions with descriptions of what they do.
+        List of ActionDetail dicts describing detected external actions.
 
     Raises:
         ValidationError: If the file isn't a valid, readable PDF.
     """
     path = validate_pdf(file_path)
-    external_actions: list[str] = []
+    external_actions: list[ActionDetail] = []
 
     try:
         reader = PdfReader(str(path))
-    except Exception:
-        # PDF is too malformed to parse
+    except Exception as e:
+        logger.debug("Failed to parse PDF for external action detection: %s", e)
         return []
 
-    def _scan_for_external_actions(obj: DictionaryObject, location: str) -> None:
+    pdf_bytes = path.read_bytes()
+
+    def _scan_for_external_actions(obj: DictionaryObject, location: str, parent=None) -> None:
         """Recursively scan a dictionary for external action types."""
         action_type = obj.get("/S")
         if action_type:
@@ -561,14 +616,16 @@ def detect_external_actions(file_path: str | Path) -> list[str]:
                         if "/P" in win:
                             details.append(f"params: {win['/P']}")
                 detail_str = f" ({', '.join(details)})" if details else ""
+                desc = f"/Launch at {location}: Launches external application{detail_str}"
                 external_actions.append(
-                    f"/Launch at {location}: Launches external application{detail_str}"
+                    _make_action_detail(desc, reader, pdf_bytes, obj, parent)
                 )
 
             elif action_type_str == "/URI":
                 uri = obj.get("/URI", "unknown")
+                desc = f"/URI at {location}: Opens URL ({uri})"
                 external_actions.append(
-                    f"/URI at {location}: Opens URL ({uri})"
+                    _make_action_detail(desc, reader, pdf_bytes, obj, parent)
                 )
 
             elif action_type_str == "/GoToR":
@@ -585,8 +642,9 @@ def detect_external_actions(file_path: str | Path) -> list[str]:
                     else:
                         details.append(f"file: {f_val}")
                 detail_str = f" ({', '.join(details)})" if details else ""
+                desc = f"/GoToR at {location}: Opens remote PDF document{detail_str}"
                 external_actions.append(
-                    f"/GoToR at {location}: Opens remote PDF document{detail_str}"
+                    _make_action_detail(desc, reader, pdf_bytes, obj, parent)
                 )
 
             elif action_type_str == "/GoToE":
@@ -605,8 +663,9 @@ def detect_external_actions(file_path: str | Path) -> list[str]:
                 if "/T" in obj:
                     details.append(f"target: {obj['/T']}")
                 detail_str = f" ({', '.join(details)})" if details else ""
+                desc = f"/GoToE at {location}: Opens embedded document{detail_str}"
                 external_actions.append(
-                    f"/GoToE at {location}: Opens embedded document{detail_str}"
+                    _make_action_detail(desc, reader, pdf_bytes, obj, parent)
                 )
 
         # Check /Next for chained actions
@@ -615,19 +674,19 @@ def detect_external_actions(file_path: str | Path) -> list[str]:
             if hasattr(next_action, "get_object"):
                 next_action = next_action.get_object()
             if isinstance(next_action, DictionaryObject):
-                _scan_for_external_actions(next_action, f"{location} (chained)")
+                _scan_for_external_actions(next_action, f"{location} (chained)", parent)
             elif isinstance(next_action, ArrayObject):
                 for i, item in enumerate(next_action):
                     item_obj = item.get_object() if hasattr(item, "get_object") else item
                     if isinstance(item_obj, DictionaryObject):
-                        _scan_for_external_actions(item_obj, f"{location} (chained {i+1})")
+                        _scan_for_external_actions(item_obj, f"{location} (chained {i+1})", parent)
 
-    def _check_action_dict(action, location: str) -> None:
+    def _check_action_dict(action, location: str, parent=None) -> None:
         """Check an action object for external actions."""
         if hasattr(action, "get_object"):
             action = action.get_object()
         if isinstance(action, DictionaryObject):
-            _scan_for_external_actions(action, location)
+            _scan_for_external_actions(action, location, parent)
 
     # Check document catalog for /OpenAction
     if reader.trailer and "/Root" in reader.trailer:
@@ -693,7 +752,7 @@ def detect_external_actions(file_path: str | Path) -> list[str]:
 
             # Check /A (action)
             if "/A" in annot:
-                _check_action_dict(annot["/A"], location)
+                _check_action_dict(annot["/A"], location, parent=annot)
 
             # Check /AA (additional actions)
             if "/AA" in annot:
@@ -710,12 +769,12 @@ def detect_external_actions(file_path: str | Path) -> list[str]:
                         ("/Bl", "Blur"),
                     ]:
                         if key in aa:
-                            _check_action_dict(aa[key], f"{location} AA {trigger}")
+                            _check_action_dict(aa[key], f"{location} AA {trigger}", parent=annot)
 
     return external_actions
 
 
-def detect_javascript(file_path: str | Path) -> list[str]:
+def detect_javascript(file_path: str | Path) -> list[ActionDetail]:
     """Detect JavaScript code embedded in a PDF.
 
     Scans for /JavaScript and /JS tags and extracts information about
@@ -725,19 +784,21 @@ def detect_javascript(file_path: str | Path) -> list[str]:
         file_path: Path to the PDF file.
 
     Returns:
-        List of detected JavaScript with descriptions of what they do.
+        List of ActionDetail dicts describing detected JavaScript.
 
     Raises:
         ValidationError: If the file isn't a valid, readable PDF.
     """
     path = validate_pdf(file_path)
-    javascript_found: list[str] = []
+    javascript_found: list[ActionDetail] = []
 
     try:
         reader = PdfReader(str(path))
-    except Exception:
-        # PDF is too malformed to parse
+    except Exception as e:
+        logger.debug("Failed to parse PDF for JavaScript detection: %s", e)
         return []
+
+    pdf_bytes = path.read_bytes()
 
     def _summarize_js(js_code: str) -> str:
         """Generate a brief summary of what the JavaScript does."""
@@ -809,7 +870,7 @@ def detect_javascript(file_path: str | Path) -> list[str]:
 
         return str(js)
 
-    def _process_js_action(action: DictionaryObject, location: str) -> None:
+    def _process_js_action(action: DictionaryObject, location: str, parent=None) -> None:
         """Process an action that may contain JavaScript."""
         action_type = action.get("/S")
         if action_type and str(action_type) in ("/JavaScript", "/JS"):
@@ -821,8 +882,9 @@ def detect_javascript(file_path: str | Path) -> list[str]:
                     code_preview += "..."
 
                 summary = _summarize_js(js_code)
+                desc = f"{location}: {summary} (code: {code_preview})"
                 javascript_found.append(
-                    f"{location}: {summary} (code: {code_preview})"
+                    _make_action_detail(desc, reader, pdf_bytes, action, parent)
                 )
 
         # Check for chained /Next actions
@@ -831,19 +893,19 @@ def detect_javascript(file_path: str | Path) -> list[str]:
             if hasattr(next_action, "get_object"):
                 next_action = next_action.get_object()
             if isinstance(next_action, DictionaryObject):
-                _process_js_action(next_action, f"{location} (chained)")
+                _process_js_action(next_action, f"{location} (chained)", parent)
             elif isinstance(next_action, ArrayObject):
                 for i, item in enumerate(next_action):
                     item_obj = item.get_object() if hasattr(item, "get_object") else item
                     if isinstance(item_obj, DictionaryObject):
-                        _process_js_action(item_obj, f"{location} (chained {i+1})")
+                        _process_js_action(item_obj, f"{location} (chained {i+1})", parent)
 
-    def _check_action(action, location: str) -> None:
+    def _check_action(action, location: str, parent=None) -> None:
         """Check an action object for JavaScript."""
         if hasattr(action, "get_object"):
             action = action.get_object()
         if isinstance(action, DictionaryObject):
-            _process_js_action(action, location)
+            _process_js_action(action, location, parent)
 
     # Check for document-level JavaScript in Names tree
     if reader.trailer and "/Root" in reader.trailer:
@@ -934,7 +996,7 @@ def detect_javascript(file_path: str | Path) -> list[str]:
 
             # Check /A (action)
             if "/A" in annot:
-                _check_action(annot["/A"], location)
+                _check_action(annot["/A"], location, parent=annot)
 
             # Check /AA (additional actions)
             if "/AA" in annot:
@@ -955,7 +1017,7 @@ def detect_javascript(file_path: str | Path) -> list[str]:
                         ("/C", "Calculate"),
                     ]:
                         if key in aa:
-                            _check_action(aa[key], f"{location} {trigger}")
+                            _check_action(aa[key], f"{location} {trigger}", parent=annot)
 
     return javascript_found
 
@@ -980,9 +1042,11 @@ def detect_embedded_file(file_path: str | Path) -> list[EmbeddedFile]:
 
     try:
         reader = PdfReader(str(path))
-    except Exception:
-        # PDF is too malformed to parse
+    except Exception as e:
+        logger.debug("Failed to parse PDF for embedded file detection: %s", e)
         return []
+
+    pdf_bytes = path.read_bytes()
 
     def _get_mime_from_data(data: bytes) -> str | None:
         """Determine MIME type from file data using magic bytes."""
@@ -1054,22 +1118,33 @@ def detect_embedded_file(file_path: str | Path) -> list[EmbeddedFile]:
                             except Exception:
                                 pass
 
+                        offset = _get_object_offset(reader, filespec)
+                        raw_hex = _read_raw_bytes_hex(pdf_bytes, offset)
+                        decoded_hex = _get_decoded_bytes_hex(stream, reader=reader)
                         embedded_files.append(EmbeddedFile(
                             name=name,
                             file_type=file_type,
                             mime_type=mime_type,
                             size=size,
                             description=description,
+                            offset=offset,
+                            raw_bytes=raw_hex,
+                            decoded_bytes=decoded_hex,
                         ))
                         break
         else:
             # FileSpec without embedded data (external reference)
+            offset = _get_object_offset(reader, filespec)
+            raw_hex = _read_raw_bytes_hex(pdf_bytes, offset)
             embedded_files.append(EmbeddedFile(
                 name=name,
                 file_type=None,
                 mime_type=None,
                 size=None,
                 description=description or "External file reference",
+                offset=offset,
+                raw_bytes=raw_hex,
+                decoded_bytes=None,
             ))
 
     def _process_annotation_filespec(annot: DictionaryObject, location: str) -> None:
@@ -1171,7 +1246,7 @@ def detect_embedded_file(file_path: str | Path) -> list[EmbeddedFile]:
     return embedded_files
 
 
-def detect_acroform(file_path: str | Path) -> list[str]:
+def detect_acroform(file_path: str | Path) -> list[ActionDetail]:
     """Detect and analyze AcroForm structures in a PDF.
 
     Scans for /AcroForm tags and provides detailed analysis of form fields,
@@ -1181,19 +1256,21 @@ def detect_acroform(file_path: str | Path) -> list[str]:
         file_path: Path to the PDF file.
 
     Returns:
-        List of descriptions of AcroForm features found.
+        List of ActionDetail dicts describing AcroForm features found.
 
     Raises:
         ValidationError: If the file isn't a valid, readable PDF.
     """
     path = validate_pdf(file_path)
-    acroform_details: list[str] = []
+    acroform_details: list[ActionDetail] = []
 
     try:
         reader = PdfReader(str(path))
-    except Exception:
-        # PDF is too malformed to parse
+    except Exception as e:
+        logger.debug("Failed to parse PDF for AcroForm detection: %s", e)
         return []
+
+    pdf_bytes = path.read_bytes()
 
     # Field type mapping
     field_types = {
@@ -1285,7 +1362,8 @@ def detect_acroform(file_path: str | Path) -> list[str]:
                 details.append("contains_javascript")
 
         if details:
-            acroform_details.append(f"Field '{current_path}': {', '.join(details)}")
+            desc = f"Field '{current_path}': {', '.join(details)}"
+            acroform_details.append(_make_action_detail(desc, reader, pdf_bytes, field))
 
         # Process child fields (/Kids array)
         if "/Kids" in field:
@@ -1339,22 +1417,26 @@ def detect_acroform(file_path: str | Path) -> list[str]:
                 acro_form = acro_form.get_object()
 
             if isinstance(acro_form, DictionaryObject):
-                acroform_details.append("AcroForm detected in document catalog")
+                acroform_details.append(
+                    _make_action_detail("AcroForm detected in document catalog", reader, pdf_bytes, acro_form)
+                )
 
                 # Check for XFA (XML Forms Architecture) - can be used for malicious purposes
                 if "/XFA" in acro_form:
-                    acroform_details.append(
+                    acroform_details.append(_make_action_detail(
                         "XFA forms detected: XML Forms Architecture present "
-                        "(can contain active content and scripts)"
-                    )
+                        "(can contain active content and scripts)",
+                        reader, pdf_bytes, acro_form,
+                    ))
 
                 # Check NeedAppearances flag
                 if "/NeedAppearances" in acro_form:
                     need_app = acro_form["/NeedAppearances"]
                     if str(need_app).lower() == "true":
-                        acroform_details.append(
-                            "NeedAppearances=true: Form appearance may be generated dynamically"
-                        )
+                        acroform_details.append(_make_action_detail(
+                            "NeedAppearances=true: Form appearance may be generated dynamically",
+                            reader, pdf_bytes, acro_form,
+                        ))
 
                 # Check SigFlags (signature-related flags)
                 if "/SigFlags" in acro_form:
@@ -1367,15 +1449,19 @@ def detect_acroform(file_path: str | Path) -> list[str]:
                         if sig_int & 2:
                             sig_details.append("AppendOnly")
                         if sig_details:
-                            acroform_details.append(f"Signature flags: {', '.join(sig_details)}")
+                            acroform_details.append(_make_action_detail(
+                                f"Signature flags: {', '.join(sig_details)}",
+                                reader, pdf_bytes, acro_form,
+                            ))
                     except (ValueError, TypeError):
                         pass
 
                 # Check for document-level scripts in /CO (calculation order)
                 if "/CO" in acro_form:
-                    acroform_details.append(
-                        "Calculation Order (/CO) defined: Fields have automatic calculation scripts"
-                    )
+                    acroform_details.append(_make_action_detail(
+                        "Calculation Order (/CO) defined: Fields have automatic calculation scripts",
+                        reader, pdf_bytes, acro_form,
+                    ))
 
                 # Process form fields
                 if "/Fields" in acro_form:
@@ -1384,7 +1470,10 @@ def detect_acroform(file_path: str | Path) -> list[str]:
                         fields = fields.get_object()
                     if isinstance(fields, ArrayObject):
                         field_count = len(fields)
-                        acroform_details.append(f"Form contains {field_count} top-level field(s)")
+                        acroform_details.append(_make_action_detail(
+                            f"Form contains {field_count} top-level field(s)",
+                            reader, pdf_bytes, acro_form,
+                        ))
 
                         for field_ref in fields:
                             field = field_ref.get_object() if hasattr(field_ref, "get_object") else field_ref
@@ -1394,7 +1483,7 @@ def detect_acroform(file_path: str | Path) -> list[str]:
     return acroform_details
 
 
-def detect_xmlforms(file_path: str | Path) -> list[str]:
+def detect_xmlforms(file_path: str | Path) -> list[ActionDetail]:
     """Detect and analyze XFA (XML Forms Architecture) in a PDF.
 
     XFA forms can contain embedded scripts (JavaScript, FormCalc) and
@@ -1404,19 +1493,21 @@ def detect_xmlforms(file_path: str | Path) -> list[str]:
         file_path: Path to the PDF file.
 
     Returns:
-        List of descriptions of XFA features and extracted scripts found.
+        List of ActionDetail dicts describing XFA features and extracted scripts found.
 
     Raises:
         ValidationError: If the file isn't a valid, readable PDF.
     """
     path = validate_pdf(file_path)
-    xfa_details: list[str] = []
+    xfa_details: list[ActionDetail] = []
 
     try:
         reader = PdfReader(str(path))
-    except Exception:
-        # PDF is too malformed to parse
+    except Exception as e:
+        logger.debug("Failed to parse PDF for XFA detection: %s", e)
         return []
+
+    pdf_bytes = path.read_bytes()
 
     def _extract_stream_data(obj) -> str | None:
         """Extract text data from a stream object."""
@@ -1430,7 +1521,7 @@ def detect_xmlforms(file_path: str | Path) -> list[str]:
                 return None
         return str(obj) if obj else None
 
-    def _analyze_xfa_xml(xml_content: str, component_name: str) -> None:
+    def _analyze_xfa_xml(xml_content: str, component_name: str, source_obj=None) -> None:
         """Analyze XFA XML content for scripts and form structure."""
         # Check for script tags
         script_patterns = [
@@ -1453,9 +1544,10 @@ def detect_xmlforms(file_path: str | Path) -> list[str]:
                     behaviors = _analyze_script_behavior(script_content, script_type)
                     behavior_str = f" - behaviors: {behaviors}" if behaviors else ""
 
-                    xfa_details.append(
-                        f"XFA {script_type} script in {component_name}{behavior_str}: {preview}"
-                    )
+                    xfa_details.append(_make_action_detail(
+                        f"XFA {script_type} script in {component_name}{behavior_str}: {preview}",
+                        reader, pdf_bytes, source_obj,
+                    ))
 
         # Check for event handlers
         event_patterns = [
@@ -1467,9 +1559,10 @@ def detect_xmlforms(file_path: str | Path) -> list[str]:
             matches = re.findall(pattern, xml_content, re.IGNORECASE)
             if matches:
                 unique_events = set(matches) if isinstance(matches[0], str) else set(m[0] if isinstance(m, tuple) else m for m in matches)
-                xfa_details.append(
-                    f"XFA {event_type}s in {component_name}: {', '.join(sorted(unique_events))}"
-                )
+                xfa_details.append(_make_action_detail(
+                    f"XFA {event_type}s in {component_name}: {', '.join(sorted(unique_events))}",
+                    reader, pdf_bytes, source_obj,
+                ))
 
         # Check for submit actions
         submit_patterns = [
@@ -1483,7 +1576,10 @@ def detect_xmlforms(file_path: str | Path) -> list[str]:
             matches = re.findall(pattern, xml_content, re.IGNORECASE)
             for match in matches:
                 if match:
-                    xfa_details.append(f"XFA submit/URL action in {component_name}: {match}")
+                    xfa_details.append(_make_action_detail(
+                        f"XFA submit/URL action in {component_name}: {match}",
+                        reader, pdf_bytes, source_obj,
+                    ))
 
         # Check for potentially dangerous operations
         dangerous_patterns = [
@@ -1505,7 +1601,10 @@ def detect_xmlforms(file_path: str | Path) -> list[str]:
 
         for pattern, description in dangerous_patterns:
             if re.search(pattern, xml_content, re.IGNORECASE):
-                xfa_details.append(f"XFA {description} detected in {component_name}")
+                xfa_details.append(_make_action_detail(
+                    f"XFA {description} detected in {component_name}",
+                    reader, pdf_bytes, source_obj,
+                ))
 
     def _analyze_script_behavior(script: str, script_type: str) -> str:
         """Analyze script content for suspicious behaviors."""
@@ -1563,12 +1662,18 @@ def detect_xmlforms(file_path: str | Path) -> list[str]:
                 if hasattr(xfa, "get_object"):
                     xfa = xfa.get_object()
 
-                xfa_details.append("XFA (XML Forms Architecture) detected")
+                xfa_details.append(_make_action_detail(
+                    "XFA (XML Forms Architecture) detected",
+                    reader, pdf_bytes, acro_form,
+                ))
 
                 # XFA can be a stream or an array of name/stream pairs
                 if isinstance(xfa, ArrayObject):
                     # Array format: [name1, stream1, name2, stream2, ...]
-                    xfa_details.append(f"XFA structure: array with {len(xfa)} elements")
+                    xfa_details.append(_make_action_detail(
+                        f"XFA structure: array with {len(xfa)} elements",
+                        reader, pdf_bytes, acro_form,
+                    ))
 
                     # Known XFA component names
                     xfa_components = {
@@ -1590,26 +1695,33 @@ def detect_xmlforms(file_path: str | Path) -> list[str]:
 
                             # Describe the component
                             component_desc = xfa_components.get(
-                                component_name, f"unknown component"
+                                component_name, "unknown component"
                             )
-                            xfa_details.append(
-                                f"XFA component '{component_name}': {component_desc}"
-                            )
+                            xfa_details.append(_make_action_detail(
+                                f"XFA component '{component_name}': {component_desc}",
+                                reader, pdf_bytes, component_stream, parent_obj=acro_form,
+                            ))
 
                             # Extract and analyze content
                             content = _extract_stream_data(component_stream)
                             if content:
-                                _analyze_xfa_xml(content, component_name)
+                                _analyze_xfa_xml(content, component_name, source_obj=component_stream)
 
                 else:
                     # Single stream containing entire XFA
-                    xfa_details.append("XFA structure: single stream")
+                    xfa_details.append(_make_action_detail(
+                        "XFA structure: single stream",
+                        reader, pdf_bytes, xfa, parent_obj=acro_form,
+                    ))
                     content = _extract_stream_data(xfa)
                     if content:
                         # Try to identify what's in the stream
                         if "<?xml" in content:
-                            xfa_details.append("XFA contains XML content")
-                        _analyze_xfa_xml(content, "main XFA stream")
+                            xfa_details.append(_make_action_detail(
+                                "XFA contains XML content",
+                                reader, pdf_bytes, xfa, parent_obj=acro_form,
+                            ))
+                        _analyze_xfa_xml(content, "main XFA stream", source_obj=xfa)
 
     return xfa_details
 
@@ -1634,8 +1746,8 @@ def detect_richmedia(file_path: str | Path) -> list[str]:
 
     try:
         reader = PdfReader(str(path))
-    except Exception:
-        # PDF is too malformed to parse
+    except Exception as e:
+        logger.debug("Failed to parse PDF for rich media detection: %s", e)
         return []
 
     # Tags to search for
@@ -1776,7 +1888,7 @@ def detect_stream_mismatches(file_path: str | Path) -> list[str]:
 
     # Find all stream objects by looking for "stream" and "endstream" markers
     # PDF streams are structured as: << /Length N >> stream\n...data...\nendstream
-    stream_pattern = rb"/Length\s+(\d+)(?:\s+\d+\s+R|\s*(?:/[A-Za-z]+\s*[^>]*)*)\s*>>[\r\n\s]*stream[\r\n]"
+    stream_pattern = rb"/Length\s+(\d+)(?:\s+\d+\s+R|[^>]*?)>>[\r\n\s]*stream[\r\n]"
 
     mismatched_count = 0
     total_streams = 0
@@ -1886,15 +1998,124 @@ def detect_stream_mismatches(file_path: str | Path) -> list[str]:
     return mismatches
 
 
+def _get_object_offset(reader: PdfReader, obj) -> int | None:
+    """Return the byte offset of a PDF indirect object, or None.
+
+    Handles both traditional xref table entries and objects stored
+    inside cross-reference (object) streams.
+    """
+    try:
+        ref = getattr(obj, "indirect_reference", None)
+        if ref is None:
+            return None
+        idnum = ref.idnum
+        generation = ref.generation
+
+        # Traditional xref table entry — direct byte offset.
+        offset = reader.xref.get(generation, {}).get(idnum)
+        if offset is not None:
+            return offset
+
+        # Object stored inside a compressed object stream.
+        # xref_objStm maps idnum -> (stream_obj_number, index_within_stream).
+        # Return the byte offset of the containing object stream.
+        if idnum in reader.xref_objStm:
+            stm_obj_num, _ = reader.xref_objStm[idnum]
+            return reader.xref.get(0, {}).get(stm_obj_num)
+
+        return None
+    except Exception:
+        return None
+
+
+def _read_raw_bytes_hex(pdf_bytes: bytes, offset: int | None, length: int = 256) -> str | None:
+    """Return hex-encoded raw bytes at *offset*, up to *length* bytes."""
+    if offset is None:
+        return None
+    try:
+        return pdf_bytes[offset : offset + length].hex(" ")
+    except Exception:
+        return None
+
+
+def _get_decoded_bytes_hex(obj, reader: PdfReader | None = None, length: int = 1024) -> str | None:
+    """Return hex-encoded decompressed stream content, or None.
+
+    Handles three cases:
+    1. *obj* is itself a stream (e.g. XFA, embedded file) → decode it directly.
+    2. *obj* is a dict stored inside a compressed Object Stream → decode the
+       containing ObjStm so the analyst gets the decompressed representation.
+    3. *obj* is a plain dict in the xref table → return None (raw_bytes already
+       shows the plaintext object).
+    """
+    target = obj
+    if hasattr(target, "get_object"):
+        target = target.get_object()
+
+    # Case 1: object is a stream itself
+    if hasattr(target, "get_data"):
+        try:
+            data = target.get_data()
+            return data[:length].hex(" ") if data else None
+        except Exception:
+            return None
+
+    # Case 2: object lives inside a compressed Object Stream
+    if reader is not None:
+        ref = getattr(target, "indirect_reference", None)
+        if ref is not None and ref.idnum in reader.xref_objStm:
+            stm_obj_num, _ = reader.xref_objStm[ref.idnum]
+            try:
+                stm_ref = IndirectObject(stm_obj_num, 0, reader)
+                stm_obj = reader.get_object(stm_ref)
+                if hasattr(stm_obj, "get_data"):
+                    data = stm_obj.get_data()
+                    return data[:length].hex(" ") if data else None
+            except Exception:
+                return None
+
+    return None
+
+
+def _make_action_detail(
+    description: str,
+    reader: PdfReader,
+    pdf_bytes: bytes,
+    obj,
+    parent_obj=None,
+) -> ActionDetail:
+    """Build an ActionDetail from a description and the originating PDF object.
+
+    If *obj* is an inline (direct) object without an indirect reference,
+    falls back to *parent_obj* (e.g. the containing annotation) for the offset.
+    """
+    offset = _get_object_offset(reader, obj)
+    if offset is None and parent_obj is not None:
+        offset = _get_object_offset(reader, parent_obj)
+    raw_bytes = _read_raw_bytes_hex(pdf_bytes, offset)
+    decoded = _get_decoded_bytes_hex(obj, reader=reader)
+    if decoded is None and parent_obj is not None:
+        decoded = _get_decoded_bytes_hex(parent_obj, reader=reader)
+    return ActionDetail(
+        description=description, offset=offset, raw_bytes=raw_bytes, decoded_bytes=decoded
+    )
+
+
 def _extract_additional_actions(
-    aa: DictionaryObject, context: str, actions_found: list[str]
+    aa: DictionaryObject,
+    context: str,
+    actions_found: list[ActionDetail],
+    reader: PdfReader,
+    pdf_bytes: bytes,
 ) -> None:
     """Extract actions from an Additional Actions (/AA) dictionary.
 
     Args:
         aa: The /AA dictionary object.
         context: Description of where the /AA was found (e.g., "Document", "Page 1").
-        actions_found: List to append action descriptions to.
+        actions_found: List to append ActionDetail dicts to.
+        reader: The PdfReader instance (for offset lookup).
+        pdf_bytes: Raw bytes of the PDF file.
     """
     # Document-level triggers
     trigger_map = {
@@ -1915,7 +2136,9 @@ def _extract_additional_actions(
                 action = action.get_object()
             action_desc = _describe_action(action, f"{context} - {trigger_name}")
             if action_desc:
-                actions_found.append(action_desc)
+                actions_found.append(
+                    _make_action_detail(action_desc, reader, pdf_bytes, action)
+                )
 
 
 def _describe_action(action: DictionaryObject | ArrayObject, trigger: str) -> str | None:
@@ -2020,7 +2243,11 @@ def extract_forms(file_path: str | Path) -> PdfForms:
     path = validate_pdf(file_path)
     submission_targets: set[str] = set()
 
-    reader = PdfReader(str(path))
+    try:
+        reader = PdfReader(str(path))
+    except Exception as e:
+        logger.warning("Failed to parse PDF for form extraction: %s", e)
+        return PdfForms(forms_present=False, form_submission_targets=[])
 
     # Check for AcroForm in the document catalog
     has_acroform = False
@@ -2218,11 +2445,37 @@ def process(file_path: str | Path) -> PdfReport:
     """
     path = validate_pdf(file_path)
 
-    md5, sha1, sha256 = compute_hashes(path)
-    urls = get_urls(path)
-    metadata = get_pdf_metadata(path)
-    anomalies = check_anomalies(path)
-    forms = extract_forms(path)
+    # Capture pypdf parser warnings to surface as anomalies
+    pypdf_warnings: list[str] = []
+    pypdf_handler = _PypdfWarningCollector(pypdf_warnings)
+    pypdf_logger = logging.getLogger("pypdf")
+    pypdf_logger.addHandler(pypdf_handler)
+
+    try:
+        logger.info("Computing file hashes...")
+        md5, sha1, sha256 = compute_hashes(path)
+
+        logger.info("Extracting URLs...")
+        urls = get_urls(path)
+
+        logger.info("Extracting metadata...")
+        metadata = get_pdf_metadata(path)
+
+        logger.info("Detecting anomalies...")
+        anomalies = check_anomalies(path)
+
+        logger.info("Extracting forms...")
+        forms = extract_forms(path)
+    finally:
+        pypdf_logger.removeHandler(pypdf_handler)
+
+    # Inject captured pypdf parser warnings into anomalies
+    if pypdf_warnings:
+        unique_warnings = sorted(set(pypdf_warnings))
+        anomalies["anomalies"].extend(
+            f"pypdf: {w}" for w in unique_warnings
+        )
+        anomalies["anomalies_present"] = True
 
     # Build the report
     report = PdfReport(
@@ -2238,4 +2491,5 @@ def process(file_path: str | Path) -> PdfReport:
     )
 
     # Defang all string fields for safe handling
+    logger.info("Analysis complete for %s", path.name)
     return _defang_value(report)

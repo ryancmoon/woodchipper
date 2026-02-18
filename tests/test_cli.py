@@ -12,7 +12,10 @@ def test_cli_version():
         capture_output=True,
         text=True,
     )
-    assert "0.1.0" in result.stdout
+    assert "woodchipper" in result.stdout
+    # Version string should be a valid semver-like pattern
+    import re
+    assert re.search(r"\d+\.\d+\.\d+", result.stdout)
 
 
 def test_cli_help():
@@ -101,3 +104,92 @@ startxref
         assert isinstance(report["forms"], dict)
         assert "forms_present" in report["forms"]
         assert "form_submission_targets" in report["forms"]
+
+
+def test_cli_verbose_produces_stderr():
+    """Test that -v flag produces logging output on stderr."""
+    pdf_content = b"""%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj
+3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj
+xref
+0 4
+0000000000 65535 f
+0000000009 00000 n
+0000000052 00000 n
+0000000101 00000 n
+trailer<</Size 4/Root 1 0 R>>
+startxref
+167
+%%EOF"""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_content)
+        f.flush()
+        result = subprocess.run(
+            [sys.executable, "-m", "woodchipper", "-v", f.name],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        # Verbose mode should produce logging on stderr
+        assert "woodchipper" in result.stderr
+        # JSON output should still be valid on stdout
+        json.loads(result.stdout)
+
+
+def test_cli_timeout_flag_accepted():
+    """Test that --timeout flag is accepted by argparse."""
+    pdf_content = b"""%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj
+3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj
+xref
+0 4
+0000000000 65535 f
+0000000009 00000 n
+0000000052 00000 n
+0000000101 00000 n
+trailer<</Size 4/Root 1 0 R>>
+startxref
+167
+%%EOF"""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_content)
+        f.flush()
+        result = subprocess.run(
+            [sys.executable, "-m", "woodchipper", "--timeout", "30", f.name],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        json.loads(result.stdout)
+
+
+def test_cli_no_stderr_without_verbose():
+    """Test backward compatibility: no extra output on stderr without -v."""
+    pdf_content = b"""%PDF-1.4
+1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj
+2 0 obj<</Type/Pages/Count 1/Kids[3 0 R]>>endobj
+3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R>>endobj
+xref
+0 4
+0000000000 65535 f
+0000000009 00000 n
+0000000052 00000 n
+0000000101 00000 n
+trailer<</Size 4/Root 1 0 R>>
+startxref
+167
+%%EOF"""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(pdf_content)
+        f.flush()
+        result = subprocess.run(
+            [sys.executable, "-m", "woodchipper", f.name],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0
+        # Without -v, no woodchipper logging should appear on stderr
+        assert "woodchipper:" not in result.stderr
+        json.loads(result.stdout)

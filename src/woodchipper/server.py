@@ -1,18 +1,29 @@
 """FastAPI HTTP server for woodchipper PDF analysis."""
 
+import logging
 import os
+import signal
 import tempfile
 from typing import Annotated
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 
+from . import __version__
 from .core import ValidationError, process
+
+DEFAULT_TIMEOUT = 60
+
+logger = logging.getLogger("woodchipper")
+
+def _timeout_handler(signum, frame):
+    raise TimeoutError(f"PDF analysis timed out after {DEFAULT_TIMEOUT} seconds")
+
 
 app = FastAPI(
     title="Woodchipper API",
     description="PDF analysis API - extracts metadata, URLs, detects anomalies, JavaScript, embedded files, and more.",
-    version="1.0.0",
+    version=__version__,
 )
 
 
@@ -55,12 +66,23 @@ async def analyze_pdf(file: Annotated[UploadFile, File(description="PDF file to 
         temp_path = f.name
 
     try:
+        logger.info("Analyzing uploaded PDF: %s", file.filename)
+        if hasattr(signal, "SIGALRM"):
+            signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(DEFAULT_TIMEOUT)
         report = process(temp_path)
+        logger.info("Analysis complete for uploaded PDF: %s", file.filename)
         return JSONResponse(content=report)
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=f"PDF analysis timed out after {DEFAULT_TIMEOUT} seconds",
+        )
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
-        # Clean up temp file
+        if hasattr(signal, "SIGALRM"):
+            signal.alarm(0)
         os.unlink(temp_path)
 
 
@@ -82,12 +104,23 @@ async def analyze_pdf_raw(
         temp_path = f.name
 
     try:
+        logger.info("Analyzing raw PDF upload (%d bytes)", len(body))
+        if hasattr(signal, "SIGALRM"):
+            signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(DEFAULT_TIMEOUT)
         report = process(temp_path)
+        logger.info("Analysis complete for raw PDF upload")
         return JSONResponse(content=report)
+    except TimeoutError:
+        raise HTTPException(
+            status_code=504,
+            detail=f"PDF analysis timed out after {DEFAULT_TIMEOUT} seconds",
+        )
     except ValidationError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
-        # Clean up temp file
+        if hasattr(signal, "SIGALRM"):
+            signal.alarm(0)
         os.unlink(temp_path)
 
 

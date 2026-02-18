@@ -1,6 +1,8 @@
 """Woodchipper - A Python library for processing PDF files."""
 
-__version__ = "0.1.0"
+from importlib.metadata import version
+
+__version__ = version("woodchipper")
 
 from .core import (
     process,
@@ -23,6 +25,7 @@ from .core import (
     PdfAnomalies,
     PdfForms,
     EmbeddedFile,
+    ActionDetail,
 )
 
 __all__ = [
@@ -46,5 +49,6 @@ __all__ = [
     "PdfAnomalies",
     "PdfForms",
     "EmbeddedFile",
+    "ActionDetail",
     "__version__",
 ]
